@@ -269,8 +269,9 @@ async def get_all_computers(limit: int = 50) -> list[dict[str, Any]]:
                 "name": item.get("name", ""),
                 "serial": item.get("serial", ""),
                 "otherserial": item.get("otherserial", ""),
-                # FIX: use _clean_value so "0" or 0 from expand_dropdowns are
-                # normalised to "" instead of showing raw "0" in the output.
+                # computertypes_id = hardware category (Notebook, Desktop, Server, …)
+                "type": _clean_value(item.get("computertypes_id")),
+                # computermodels_id = specific product name (e.g. ESPRIMO Mobile U9200)
                 "model": _clean_value(item.get("computermodels_id")) or _clean_value(item.get("model")),
                 "status": _clean_value(item.get("states_id")) or _clean_value(item.get("status")),
                 "location": _clean_value(item.get("locations_id")) or _clean_value(item.get("location")),
@@ -282,6 +283,20 @@ async def get_all_computers(limit: int = 50) -> list[dict[str, Any]]:
         logger.warning("get_all_computers failed: %s", exc)
         return []
 
+async def get_total_computers_count() -> int:
+    """Fetch the total number of computers registered in GLPI."""
+    try:
+        data = await _get("/search/Computer", params={
+            "is_recursive": "1",
+            "range": "0-1"
+        })
+        if isinstance(data, dict) and "totalcount" in data:
+            return int(data["totalcount"])
+        return 0
+    except Exception as exc:
+        logger.warning("get_total_computers_count failed: %s", exc)
+        return 0
+    
 
 async def get_computer_by_id(computer_id: int) -> dict[str, Any] | None:
     """Fetch a single computer with its financial data and linked contracts.
@@ -309,6 +324,9 @@ async def get_computer_by_id(computer_id: int) -> dict[str, Any] | None:
             "name": data.get("name", ""),
             "serial": data.get("serial", ""),
             "otherserial": data.get("otherserial", ""),
+            # computertypes_id = hardware category (Notebook, Desktop, Server, …)
+            "type": _clean_value(data.get("computertypes_id")),
+            # computermodels_id = specific product name (e.g. ESPRIMO Mobile U9200)
             "model": _clean_value(data.get("computermodels_id")),
             "status": _clean_value(data.get("states_id")),
             "location": _clean_value(data.get("locations_id")),
@@ -367,6 +385,7 @@ async def get_user_assets(user_id: int) -> list[dict[str, Any]]:
             "name": item.get("name", ""),
             "serial": item.get("serial", ""),
             "otherserial": item.get("otherserial", ""),
+            "type": _clean_value(item.get("computertypes_id")),
             "model": _clean_value(item.get("computermodels_id")) or _clean_value(item.get("model")),
             "status": _clean_value(item.get("states_id")) or _clean_value(item.get("status")),
             "location": _clean_value(item.get("locations_id")) or _clean_value(item.get("location")),
@@ -474,6 +493,71 @@ async def get_user_assets(user_id: int) -> list[dict[str, Any]]:
         user_id,
     )
     return []
+
+
+async def search_computer_by_name(
+    name: str,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Search computers by name using the GLPI Search API with a server-side filter.
+
+    This is the CORRECT tool for finding a specific computer by name from 20,000+
+    records.  Unlike ``get_all_computers()`` (which only fetches the first N rows),
+    this function issues a targeted search and GLPI returns only the matching rows.
+
+    Strategy:
+      1. POST a search request to ``/search/Computer`` filtering on field 2 (name).
+      2. For each matching ID, call ``get_computer_by_id`` to retrieve full details
+         (type, model, location, serial, financial data, contracts).  This guarantees
+         the ``type`` field is always populated correctly from ``computertypes_id``.
+
+    Args:
+        name  : Computer name (or partial name) to search for.
+        limit : Maximum number of results to return (default 5).
+
+    Returns:
+        List of computer dicts identical in shape to ``get_computer_by_id`` output.
+    """
+    try:
+        # Step 1: find matching computer IDs via Search API
+        search_data = await _get("/search/Computer", params={
+            "criteria[0][field]": 2,             # field 2 = name
+            "criteria[0][searchtype]": "contains",
+            "criteria[0][value]": name,
+            "range": f"0-{limit - 1}",
+            "forcedisplay[0]": 1,                # ID
+            "forcedisplay[1]": 2,                # Name
+        })
+
+        items: list[Any] = _extract_data(search_data)
+        if not items:
+            logger.info("search_computer_by_name: no results for name='%s'", name)
+            return []
+
+        logger.info(
+            "search_computer_by_name: found %d match(es) for name='%s'",
+            len(items), name,
+        )
+
+        # Step 2: fetch full detail for each matched computer
+        results: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            computer_id_raw = _first(item, "1", "id")
+            try:
+                computer_id = int(computer_id_raw)
+            except (TypeError, ValueError):
+                continue
+            detail = await get_computer_by_id(computer_id)
+            if detail:
+                results.append(detail)
+
+        return results
+
+    except Exception as exc:
+        logger.warning("search_computer_by_name failed (name='%s'): %s", name, exc)
+        return []
  
  
 def _first(item: dict[str, Any], *keys: str) -> Any:

@@ -185,6 +185,7 @@ class GetUserAssetsTool(BaseTool):
                     f"{idx}. **{item.get('name', '-')}**\n"
                     f"   ID            : {item.get('id', '-')}\n"
                     f"   Serial Number : {item.get('serial', '-') or '(tidak ada)'}\n"
+                    f"   Type          : {item.get('type', '-') or '(tidak ada)'}\n"
                     f"   Model         : {item.get('model', '-') or '(tidak ada)'}\n"
                     f"   Status        : {item.get('status', '-') or '(tidak ada)'}\n\n"
                 )
@@ -212,9 +213,9 @@ class GetAllComputersTool(BaseTool):
     """Ambil semua komputer di GLPI (untuk IT Admin)."""
     name: str = "get_all_computers"
     description: str = (
-        "Ambil daftar SEMUA komputer yang terdaftar di inventaris GLPI. "
-        "Gunakan untuk pertanyaan tentang jumlah total komputer, daftar inventaris, "
-        "atau komputer tertentu berdasarkan serial number. "
+        "Ambil daftar SEMUA komputer yang terdaftar di inventaris GLPI (urut dari ID terkecil). "
+        "Gunakan untuk: menelusuri inventaris umum, atau melihat daftar komputer tanpa filter nama. "
+        "JANGAN gunakan untuk mencari komputer berdasarkan nama — gunakan search_computer_by_name. "
         "JANGAN gunakan untuk mencari aset milik user tertentu — gunakan get_user_assets."
     )
     args_schema: Type[BaseModel] = GetAllComputersInput
@@ -244,6 +245,7 @@ class GetAllComputersTool(BaseTool):
                 output += (
                     f"{idx}. **{comp.get('name', '-')}** (ID: {comp.get('id', '-')})\n"
                     f"   Serial   : {comp.get('serial', '-') or '(tidak ada)'}\n"
+                    f"   Type     : {comp.get('type', '-') or '(tidak ada)'}\n"
                     f"   Model    : {comp.get('model', '-') or '(tidak ada)'}\n"
                     f"   Status   : {comp.get('status', '-') or '(tidak ada)'}\n"
                     f"   Lokasi   : {comp.get('location', '-') or '(tidak ada)'}\n"
@@ -261,8 +263,11 @@ class GetComputerDetailInput(BaseModel):
 class GetComputerDetailTool(BaseTool):
     name: str = "get_computer_detail"
     description: str = (
-        "Ambil detail lengkap satu komputer berdasarkan ID-nya, termasuk data finansial "
-        "dan kontrak terkait."
+        "Ambil detail LENGKAP satu komputer berdasarkan ID-nya, termasuk Type, Model, "
+        "Serial Number, Lokasi, Status, data finansial, dan kontrak terkait. "
+        "WAJIB dipanggil saat user meminta 'data lengkap', 'data jelas', 'data detail', "
+        "'info lengkap', atau 'semua informasi' suatu komputer — "
+        "MESKIPUN nama komputer sudah pernah disebut di riwayat percakapan sebelumnya."
     )
     args_schema: Type[BaseModel] = GetComputerDetailInput
 
@@ -272,10 +277,19 @@ class GetComputerDetailTool(BaseTool):
             if not comp:
                 return f"Komputer dengan ID {computer_id} tidak ditemukan."
 
-            output = f"Detail Komputer (ID: {computer_id}):\n"
-            for key, val in comp.items():
-                if key != "contracts":
-                    output += f"  {key}: {val or '(tidak ada)'}\n"
+            output = f"Detail Komputer **{comp.get('name', '-')}** (ID: {computer_id}):\n\n"
+            output += f"  Nama          : {comp.get('name', '-') or '(tidak ada)'}\n"
+            output += f"  Serial Number : {comp.get('serial', '-') or '(tidak ada)'}\n"
+            output += f"  Other Serial  : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
+            output += f"  Type          : {comp.get('type', '-') or '(tidak ada)'}\n"
+            output += f"  Model         : {comp.get('model', '-') or '(tidak ada)'}\n"
+            output += f"  Status        : {comp.get('status', '-') or '(tidak ada)'}\n"
+            output += f"  Lokasi        : {comp.get('location', '-') or '(tidak ada)'}\n"
+            output += f"  User          : {comp.get('user', '-') or '(tidak ada)'}\n"
+            output += f"  Tgl Beli      : {comp.get('buy_date', '-') or '(tidak ada)'}\n"
+            output += f"  Garansi       : {comp.get('warranty_duration', '-') or '(tidak ada)'}\n"
+            output += f"  Nilai Aset    : {comp.get('value', '-') or '(tidak ada)'}\n"
+            output += f"  Supplier      : {comp.get('supplier', '-') or '(tidak ada)'}\n"
             if comp.get("contracts"):
                 output += "\nKontrak terkait:\n"
                 for c in comp["contracts"]:
@@ -284,6 +298,94 @@ class GetComputerDetailTool(BaseTool):
         except Exception as exc:
             return f"Gagal mengambil detail komputer: {exc}"
 
+
+class CountAllComputersInput(BaseModel):
+    pass
+
+class CountAllComputersTool(BaseTool):
+    name: str = "count_all_computers"
+    description: str = (
+        "Ambil TOTAL atau JUMLAH KESELURUHAN komputer yang ada di GLPI. "
+        "Gunakan tool ini HANYA jika ditanya 'ada berapa', 'jumlah', atau 'total' komputer. "
+        "Jangan gunakan tool ini jika user meminta nama atau daftar spesifik."
+    )
+    args_schema: Type[BaseModel] = CountAllComputersInput
+
+    def _run(self, **kwargs)-> str:
+        try:
+            total = _run_async(it_glpi_client.get_total_computers_count())
+            return f"Total komputer yang terdaftar di sistem adalah {total} unit."
+        except Exception as exc:
+            return f"Gagal menghitung jumlah komputer: {exc}"
+
+
+# ── Search Computer by Name ───────────────────────────────────────────────────
+
+class SearchComputerByNameInput(BaseModel):
+    """Input schema for SearchComputerByNameTool."""
+    name: str = Field(
+        ...,
+        description=(
+            "Nama komputer (atau sebagian nama) yang ingin dicari. "
+            "Contoh: 'M01463L09', 'D02028', 'LAPTOP-FINANCE'."
+        ),
+    )
+    limit: int = Field(
+        default=5, ge=1, le=20,
+        description="Jumlah maksimum hasil yang dikembalikan (default 5).",
+    )
+
+
+class SearchComputerByNameTool(BaseTool):
+    """Cari komputer spesifik berdasarkan nama menggunakan GLPI Search API."""
+
+    name: str = "search_computer_by_name"
+    description: str = (
+        "Cari komputer SPESIFIK berdasarkan nama (atau sebagian nama) dari seluruh "
+        "inventaris GLPI menggunakan Search API — tanpa batasan jumlah record. "
+        "WAJIB gunakan tool ini saat user menyebut nama komputer tertentu "
+        "(contoh: 'M01463L09', 'D02028L07'). "
+        "Hasilnya mencakup: ID, Nama, Serial Number, Type (kategori hardware), "
+        "Model (nama produk), Status, Lokasi, User, dan data finansial. "
+        "JANGAN gunakan get_all_computers untuk mencari berdasarkan nama — "
+        "get_all_computers hanya mengambil 200 record pertama dari 20.000+ data."
+    )
+    args_schema: Type[BaseModel] = SearchComputerByNameInput
+
+    def _run(self, name: str, limit: int = 5) -> str:
+        logger.info("Tool SearchByName | name='%s' limit=%s", name, limit)
+        try:
+            results: list[dict[str, Any]] = _run_async(
+                it_glpi_client.search_computer_by_name(name=name, limit=limit)
+            )
+            if not results:
+                return f"Komputer dengan nama yang mengandung '{name}' tidak ditemukan di GLPI."
+
+            output = f"Hasil pencarian komputer '{name}' ({len(results)} ditemukan):\n\n"
+            for comp in results:
+                output += (
+                    f"**{comp.get('name', '-')}** (ID: {comp.get('id', '-')})\n"
+                    f"  Serial Number : {comp.get('serial', '-') or '(tidak ada)'}\n"
+                    f"  Other Serial  : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
+                    f"  Type          : {comp.get('type', '-') or '(tidak ada)'}\n"
+                    f"  Model         : {comp.get('model', '-') or '(tidak ada)'}\n"
+                    f"  Status        : {comp.get('status', '-') or '(tidak ada)'}\n"
+                    f"  Lokasi        : {comp.get('location', '-') or '(tidak ada)'}\n"
+                    f"  User          : {comp.get('user', '-') or '(tidak ada)'}\n"
+                    f"  Tgl Beli      : {comp.get('buy_date', '-') or '(tidak ada)'}\n"
+                    f"  Garansi       : {comp.get('warranty_duration', '-') or '(tidak ada)'}\n"
+                    f"  Nilai Aset    : {comp.get('value', '-') or '(tidak ada)'}\n"
+                    f"  Supplier      : {comp.get('supplier', '-') or '(tidak ada)'}\n"
+                )
+                if comp.get("contracts"):
+                    output += "  Kontrak       :\n"
+                    for c in comp["contracts"]:
+                        output += f"    - {c.get('name', '-')} (ID: {c.get('id', '-')})\n"
+                output += "\n"
+            return output
+        except Exception as exc:
+            logger.error("SearchComputerByName failed: %s", exc)
+            return f"Gagal mencari komputer '{name}': {exc}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Contracts
@@ -548,3 +650,4 @@ tool_get_tickets         = GetTicketsTool()
 tool_get_user_info       = GetUserInfoTool()
 tool_get_categories      = GetCategoriesTool()
 tool_get_suppliers       = GetSuppliersTool()
+tool_count_all_computers  = CountAllComputersTool()

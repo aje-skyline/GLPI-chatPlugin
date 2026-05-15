@@ -21,6 +21,7 @@ from app.tools import (
     tool_get_user_info,
     tool_get_categories,
     tool_get_suppliers,
+    tool_count_all_computers,
 )
 
 # ── Agent Identity ────────────────────────────────────────────────────────────
@@ -52,15 +53,17 @@ BACKSTORY: str = (
     "DILARANG membuat asumsi seperti 'mungkin ada X kontrak' tanpa bukti dari tool.\n\n"
  
     "╔══ ATURAN 3 — PILIH TOOL YANG TEPAT ══╗\n"
-    "• User bertanya 'komputer saya' / 'aset milik user X' → get_assets_by_user\n"
-    "• User bertanya 'semua komputer' / 'daftar inventaris' → list_all_computers\n"
+    "• User bertanya 'ada berapa komputer' / 'total komputer' / 'jumlah komputer' "
+    "/ 'berapa banyak komputer' → WAJIB gunakan count_all_computers (bukan get_all_computers!)\n"
+    "• User bertanya 'komputer saya' / 'aset milik user X' → get_user_assets\n"
+    "• User bertanya 'semua komputer' / 'daftar inventaris' / 'list komputer' → get_all_computers\n"
     "• User bertanya detail 1 komputer by ID → get_computer_detail\n"
     "• User bertanya 'kontrak' / 'contract' / 'vendor agreement' → list_all_contracts\n"
     "• User bertanya detail 1 kontrak by ID → get_contract_detail\n"
     "• User bertanya 'tiket saya' / 'request saya' → get_user_tickets\n"
-    "• User bertanya 'profil saya' / 'info akun' → get_user_profile\n"
-    "• User bertanya 'supplier' / 'vendor' → list_suppliers\n"
-    "• User bertanya 'kategori' / 'jenis tiket' → list_itil_categories\n"
+    "• User bertanya 'profil saya' / 'info akun' → get_user_info\n"
+    "• User bertanya 'supplier' / 'vendor' → get_suppliers\n"
+    "• User bertanya 'kategori' / 'jenis tiket' → get_itil_categories\n"
     "• User bertanya cara/prosedur/panduan → search_knowledge_base\n\n"
  
     "╔══ ATURAN 4 — FORMAT OUTPUT BERSIH ══╗\n"
@@ -79,21 +82,20 @@ BACKSTORY: str = (
 def build_it_support(llm: LLM, glpi_user_id: int = 0) -> Agent:
     """Build the IT Support Agent with the appropriate toolset."""
     
-    # Masukkan SEMUA tools secara langsung tanpa kondisi if
     tools: list[Any] = [
-        tool_search_kb,           
-        tool_get_all_computers,   
-        tool_get_computer_detail, 
-        tool_get_contracts,       
-        tool_get_contract_detail, 
-        tool_get_multiple_items,  
-        tool_list_search_options, 
-        tool_get_categories,      
-        tool_get_suppliers,       
-        # Tool spesifik user juga langsung dimasukkan
-        tool_get_assets,    
-        tool_get_tickets,   
-        tool_get_user_info, 
+        tool_search_kb,
+        tool_get_assets,
+        tool_get_all_computers,
+        tool_get_computer_detail,
+        tool_get_contracts,
+        tool_get_contract_detail,
+        tool_get_multiple_items,
+        tool_list_search_options,
+        tool_get_tickets,
+        tool_get_user_info,
+        tool_get_categories,
+        tool_get_suppliers,
+        tool_count_all_computers,
     ]
 
     return Agent(
