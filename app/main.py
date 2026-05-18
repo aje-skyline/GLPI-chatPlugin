@@ -45,6 +45,46 @@ from app.crew_services import run_crew
 
 logger = logging.getLogger(__name__)
 
+# ── Sanitize assistant messages ───────────────────────────────────────────────
+
+def _sanitize_assistant_message(text: str) -> str:
+    """Hapus internal agent format (Thought/Action/Observation) dari riwayat
+    asisten sebelum dimasukkan ke task context iterasi berikutnya.
+
+    LLM cenderung meniru pola yang dilihat di riwayat. Jika respons sebelumnya
+    mengandung 'Thought:' / 'Action:' yang bocor, LLM akan mengulangi pola
+    tersebut dan menghasilkan Final Answer tanpa benar-benar memanggil tool.
+
+    Strategi:
+      1. Jika ada 'Final Answer:' → ambil hanya teks setelahnya.
+      2. Buang semua baris yang diawali Thought/Action/Action Input/Observation.
+      3. Kembalikan teks bersih yang hanya berisi jawaban natural.
+    """
+    if not text:
+        return text
+
+    # Strategi 1: ambil bagian setelah 'Final Answer:' jika ada
+    if "Final Answer:" in text:
+        text = text.split("Final Answer:", 1)[-1].strip()
+
+    # Strategi 2: buang baris internal agent
+    lines = text.splitlines()
+    clean_lines: list[str] = []
+    skip_block = False
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^(Thought|Action|Action Input|Observation)\s*:", stripped):
+            skip_block = True
+            continue
+        # Baris kosong setelah blok yang di-skip ikut di-skip
+        if skip_block and stripped == "":
+            continue
+        skip_block = False
+        clean_lines.append(line)
+
+    return "\n".join(clean_lines).strip()
+
+
 # ── In-memory session store ───────────────────────────────────────────────────
 _user_sessions: dict[str, int] = {}
 _session_last_seen: dict[str, float] = {}
@@ -209,8 +249,9 @@ async def _stream_crew_response(
         yield _sse_event("error", {"error": f"Crew Error: {exc}"})
         return
 
-    # Persist to session
-    assistant_msg = {"role": "assistant", "content": final_answer}
+    # Persist to session — sanitasi dulu agar Thought/Action tidak bocor ke konteks berikutnya
+    clean_answer = _sanitize_assistant_message(final_answer)
+    assistant_msg = {"role": "assistant", "content": clean_answer}
     _session_messages[session_id] = (messages + [assistant_msg])[-_MAX_SESSION_MESSAGES:]
     _session_last_seen[session_id] = time.time()
 
@@ -345,7 +386,9 @@ async def chat_completions(request: Request, response: Response):
             None, run_crew, user_message, glpi_user_id, messages
         )
 
-        assistant_msg = {"role": "assistant", "content": final_answer}
+        # Sanitasi dulu agar Thought/Action tidak bocor ke konteks berikutnya
+        clean_answer = _sanitize_assistant_message(final_answer)
+        assistant_msg = {"role": "assistant", "content": clean_answer}
         _session_messages[session_id] = (messages + [assistant_msg])[-_MAX_SESSION_MESSAGES:]
         _session_last_seen[session_id] = time.time()
 

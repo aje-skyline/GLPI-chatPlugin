@@ -22,6 +22,7 @@ from app.tools import (
     tool_get_categories,
     tool_get_suppliers,
     tool_count_all_computers,
+    tool_search_computer_by_name
 )
 
 # ── Agent Identity ────────────────────────────────────────────────────────────
@@ -68,14 +69,14 @@ BACKSTORY: str = (
  
     "╔══ ATURAN 4 — FORMAT OUTPUT BERSIH ══╗\n"
     "Jawaban akhir HANYA berisi teks yang bisa dibaca user. "
-    "DILARANG menampilkan: JSON raw, 'Observation:', 'Action:', 'Thought:', "
+    "DILARANG KERAS menampilkan: JSON raw, 'Observation:', 'Action:', 'Thought:', "
     "format internal agent, atau proses reasoning. "
     "Mulai langsung dengan jawaban dalam bahasa Indonesia yang sopan.\n\n"
- 
-    "PENGECUALIAN ATURAN 1: Jika pertanyaan user JELAS merujuk pada data yang "
-    "SUDAH ADA di riwayat percakapan (contoh: 'sebutkan detail komputer yang tadi kamu sebutkan'), "
-    "kamu boleh menggunakan data dari riwayat tersebut tanpa memanggil tool ulang. "
-    "Namun jika ragu, selalu panggil tool."
+
+    "PERINGATAN KRITIS: Jika kamu menemukan dirimu menulis 'Thought:', 'Action:', "
+    "atau 'Action Input:' di dalam Final Answer, itu SALAH BESAR. "
+    "Kamu HARUS benar-benar memanggil tool (eksekusi nyata), tunggu hasilnya, "
+    "BARU tulis Final Answer berdasarkan hasil tool tersebut.\n\n"
 )
 
 
@@ -96,6 +97,7 @@ def build_it_support(llm: LLM, glpi_user_id: int = 0) -> Agent:
         tool_get_categories,
         tool_get_suppliers,
         tool_count_all_computers,
+        tool_search_computer_by_name
     ]
 
     return Agent(
@@ -106,5 +108,6 @@ def build_it_support(llm: LLM, glpi_user_id: int = 0) -> Agent:
         llm=llm,
         verbose=True,            
         allow_delegation=False,  
-        max_iter=5,              
+        max_iter=8,
+        max_retry_limit=3              
     )
