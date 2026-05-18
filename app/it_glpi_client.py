@@ -633,6 +633,58 @@ async def search_computer_by_name(name: str, limit: int = 50) -> list[dict[str, 
         logger.warning("search_computer_by_name failed: %s", exc)
         return []
 
+async def search_computer(query: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Universal computer search — matches Name, Serial Number, OR Inventory Number.
+ 
+    Single API call using GLPI's OR-criteria so the user can type any identifier
+    (hostname, SN, inventory tag) without knowing which field it lives in.
+ 
+    Endpoint: GET /search/Computer with OR across fields 1, 5, 6.
+ 
+    Args:
+        query: Free-text query matched (case-insensitive ``contains``) against:
+               • field 1  — Name
+               • field 5  — Serial Number
+               • field 6  — Inventory Number (otherserial)
+        limit: Maximum number of results (default 10).
+ 
+    Returns:
+        List of normalised computer dicts (same schema as other Computer functions).
+        Returns an empty list on error.
+    """ 
+    try: 
+        params: dict[str, Any] = {
+            # ── OR criteria across the three most-searched fields ────────────
+            "criteria[0][field]":      1,            # Name
+            "criteria[0][searchtype]": "contains",
+            "criteria[0][value]":      query,
+ 
+            "criteria[1][link]":       "OR",
+            "criteria[1][field]":      5,            # Serial Number
+            "criteria[1][searchtype]": "contains",
+            "criteria[1][value]":      query,
+ 
+            "criteria[2][link]":       "OR",
+            "criteria[2][field]":      6,            # Inventory Number (otherserial)
+            "criteria[2][searchtype]": "contains",
+            "criteria[2][value]":      query,
+ 
+            # ── Common display options ────────────────────────────────────────
+            "range":            f"0-{limit - 1}",
+            "expand_dropdowns": "true",
+            **_COMPUTER_SEARCH_FORCEDISPLAY,
+        }
+        data = await _get("/search/Computer", params=params)
+        items: list[Any] = _extract_data(data)
+
+        results = [_parse_computer_search_item(item) for item in items if isinstance(item, dict)]
+        logger.info(
+            "search_computer: query='%s' ->%d results(s)", query, len(results)
+        )
+        return results
+    except Exception as exc:
+        logger.warning("search_computer failed (query='%s'): %s", query, exc)
+        return []
 
 def _first(item: dict[str, Any], *keys: str) -> Any:
     """Return the first non-empty value from ``item`` matching any of ``keys``."""
@@ -641,6 +693,7 @@ def _first(item: dict[str, Any], *keys: str) -> Any:
         if v is not None and v != "":
             return v
     return ""
+
 
 
 # ── Shared Search API constants ───────────────────────────────────────────────
