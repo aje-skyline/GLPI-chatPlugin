@@ -179,16 +179,25 @@ class GetUserAssetsTool(BaseTool):
             if not results:
                 return "User tidak memiliki aset komputer yang terdaftar."
 
-            output = "Daftar aset komputer user:\n\n"
+            output = f"Daftar aset komputer user ({len(results)} item):\n\n"
             for idx, item in enumerate(results, 1):
                 output += (
                     f"{idx}. **{item.get('name', '-')}**\n"
-                    f"   ID            : {item.get('id', '-')}\n"
-                    f"   Serial Number : {item.get('serial', '-') or '(tidak ada)'}\n"
-                    f"   Type          : {item.get('type', '-') or '(tidak ada)'}\n"
-                    f"   Model         : {item.get('model', '-') or '(tidak ada)'}\n"
-                    f"   Status        : {item.get('status', '-') or '(tidak ada)'}\n\n"
+                    f"   ID               : {item.get('id', '-')}\n"
+                    f"   Serial Number    : {item.get('serial', '-') or '(tidak ada)'}\n"
+                    f"   Inventory Number : {item.get('otherserial', '-') or '(tidak ada)'}\n"
+                    f"   Type             : {item.get('type', '-') or '(tidak ada)'}\n"
+                    f"   Model            : {item.get('model', '-') or '(tidak ada)'}\n"
+                    f"   Status           : {item.get('status', '-') or '(tidak ada)'}\n"
+                    f"   Lokasi           : {item.get('location', '-') or '(tidak ada)'}\n"
                 )
+                if item.get("entity"):
+                    output += f"   Entity           : {item['entity']}\n"
+                if item.get("manufacturer"):
+                    output += f"   Pabrikan         : {item['manufacturer']}\n"
+                if item.get("os"):
+                    output += f"   OS               : {item['os']}\n"
+                output += "\n"
             return output
         except Exception as exc:
             logger.error("Asset fetch failed: %s", exc)
@@ -224,13 +233,11 @@ class GetAllComputersTool(BaseTool):
         logger.info("Tool All Computers | limit=%s | has_serial=%s", limit, has_serial)
         try:
             results: list[dict[str, Any]] = _run_async(
-                it_glpi_client.get_all_computers(limit=limit)
+                # E.2: has_serial now passed to client for server-side filtering
+                it_glpi_client.get_all_computers(limit=limit, has_serial=has_serial)
             )
             if not results:
                 return "Tidak ada komputer ditemukan."
-
-            if has_serial:
-                results = [c for c in results if c.get("serial", "").strip()]
 
             if not results:
                 return "Tidak ada komputer yang memiliki serial number."
@@ -245,12 +252,22 @@ class GetAllComputersTool(BaseTool):
                 output += (
                     f"{idx}. **{comp.get('name', '-')}** (ID: {comp.get('id', '-')})\n"
                     f"   Serial   : {comp.get('serial', '-') or '(tidak ada)'}\n"
+                    f"   Inv. No  : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
                     f"   Type     : {comp.get('type', '-') or '(tidak ada)'}\n"
                     f"   Model    : {comp.get('model', '-') or '(tidak ada)'}\n"
                     f"   Status   : {comp.get('status', '-') or '(tidak ada)'}\n"
                     f"   Lokasi   : {comp.get('location', '-') or '(tidak ada)'}\n"
-                    f"   User     : {comp.get('user', '-') or '(tidak ada)'}\n\n"
+                    f"   User     : {comp.get('user', '-') or '(tidak ada)'}\n"
                 )
+                if comp.get("entity"):
+                    output += f"   Entity   : {comp['entity']}\n"
+                if comp.get("manufacturer"):
+                    output += f"   Pabrikan : {comp['manufacturer']}\n"
+                if comp.get("os"):
+                    output += f"   OS       : {comp['os']}\n"
+                if comp.get("date_mod"):
+                    output += f"   Update   : {comp['date_mod']}\n"
+                output += "\n"
             return output
         except Exception as exc:
             logger.error("Computer list failed: %s", exc)
@@ -278,22 +295,40 @@ class GetComputerDetailTool(BaseTool):
                 return f"Komputer dengan ID {computer_id} tidak ditemukan."
 
             output = f"Detail Komputer **{comp.get('name', '-')}** (ID: {computer_id}):\n\n"
-            output += f"  Nama          : {comp.get('name', '-') or '(tidak ada)'}\n"
-            output += f"  Serial Number : {comp.get('serial', '-') or '(tidak ada)'}\n"
-            output += f"  Other Serial  : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
-            output += f"  Type          : {comp.get('type', '-') or '(tidak ada)'}\n"
-            output += f"  Model         : {comp.get('model', '-') or '(tidak ada)'}\n"
-            output += f"  Status        : {comp.get('status', '-') or '(tidak ada)'}\n"
-            output += f"  Lokasi        : {comp.get('location', '-') or '(tidak ada)'}\n"
-            output += f"  User          : {comp.get('user', '-') or '(tidak ada)'}\n"
-            output += f"  Tgl Beli      : {comp.get('buy_date', '-') or '(tidak ada)'}\n"
-            output += f"  Garansi       : {comp.get('warranty_duration', '-') or '(tidak ada)'}\n"
-            output += f"  Nilai Aset    : {comp.get('value', '-') or '(tidak ada)'}\n"
-            output += f"  Supplier      : {comp.get('supplier', '-') or '(tidak ada)'}\n"
+            output += f"  Nama             : {comp.get('name', '-') or '(tidak ada)'}\n"
+            output += f"  Serial Number    : {comp.get('serial', '-') or '(tidak ada)'}\n"
+            output += f"  Inventory Number : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
+            output += f"  Type             : {comp.get('type', '-') or '(tidak ada)'}\n"
+            output += f"  Model            : {comp.get('model', '-') or '(tidak ada)'}\n"
+            output += f"  Status           : {comp.get('status', '-') or '(tidak ada)'}\n"
+            output += f"  Lokasi           : {comp.get('location', '-') or '(tidak ada)'}\n"
+            output += f"  User             : {comp.get('user', '-') or '(tidak ada)'}\n"
+            # B: enrichment fields
+            if comp.get("entity"):
+                output += f"  Entity           : {comp['entity']}\n"
+            if comp.get("manufacturer"):
+                output += f"  Pabrikan         : {comp['manufacturer']}\n"
+            if comp.get("os"):
+                output += f"  OS               : {comp['os']}\n"
+            if comp.get("contact"):
+                output += f"  Alt. Username    : {comp['contact']}\n"
+            if comp.get("comment"):
+                output += f"  Keterangan       : {comp['comment']}\n"
+            if comp.get("date_mod"):
+                output += f"  Last Update      : {comp['date_mod']}\n"
+            output += "\nData Finansial:\n"
+            output += f"  Tgl Beli         : {comp.get('buy_date', '-') or '(tidak ada)'}\n"
+            output += f"  Tgl Pakai        : {comp.get('use_date', '-') or '(tidak ada)'}\n"
+            output += f"  Garansi          : {comp.get('warranty_duration', '-') or '(tidak ada)'} bulan\n"
+            if comp.get("warranty_date"):
+                output += f"  Garansi Berakhir : {comp['warranty_date']}\n"
+            output += f"  Nilai Aset       : {comp.get('value', '-') or '(tidak ada)'}\n"
+            output += f"  Supplier         : {comp.get('supplier', '-') or '(tidak ada)'}\n"
             if comp.get("contracts"):
                 output += "\nKontrak terkait:\n"
                 for c in comp["contracts"]:
-                    output += f"  - {c.get('name', '-')} (ID: {c.get('id', '-')})\n"
+                    end = c.get("end_date") or "(tidak ada)"
+                    output += f"  - {c.get('name', '-')} (ID: {c.get('id', '-')}) | Berakhir: {end}\n"
             return output
         except Exception as exc:
             return f"Gagal mengambil detail komputer: {exc}"
@@ -336,16 +371,33 @@ class SearchComputerByNameTool(BaseTool):
     )
     args_schema: Type[BaseModel] = SearchComputerByNameInput
 
-    def _run(self, name: str, limit: int) -> str:
+    def _run(self, name: str, limit: int = 50) -> str:
         logger.info("Tool Search Computer | name=%s | limit=%s", name, limit)
         try:
             results = _run_async(it_glpi_client.search_computer_by_name(name, limit))
             if not results:
                 return f"Komputer dengan nama '{name}' tidak ditemukan."
-            
-            output = f"Hasil pencarian untuk '{name}':\n\n"
+
+            output = f"Hasil pencarian '{name}' ({len(results)} item):\n\n"
             for idx, comp in enumerate(results, 1):
-                output += f"{idx}. **{comp.get('name', '-')}** (ID: {comp.get('id', '-')})\n"
+                output += (
+                    f"{idx}. **{comp.get('name', '-')}** (ID: {comp.get('id', '-')})\n"
+                    f"   Serial   : {comp.get('serial', '-') or '(tidak ada)'}\n"
+                    f"   Inv. No  : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
+                    f"   Type     : {comp.get('type', '-') or '(tidak ada)'}\n"
+                    f"   Model    : {comp.get('model', '-') or '(tidak ada)'}\n"
+                    f"   Status   : {comp.get('status', '-') or '(tidak ada)'}\n"
+                    f"   Lokasi   : {comp.get('location', '-') or '(tidak ada)'}\n"
+                )
+                if comp.get("entity"):
+                    output += f"   Entity   : {comp['entity']}\n"
+                if comp.get("manufacturer"):
+                    output += f"   Pabrikan : {comp['manufacturer']}\n"
+                if comp.get("os"):
+                    output += f"   OS       : {comp['os']}\n"
+                if comp.get("date_mod"):
+                    output += f"   Update   : {comp['date_mod']}\n"
+                output += "\n"
             return output
         except Exception as exc:
             logger.error("Computer search failed: %s", exc)
@@ -511,8 +563,8 @@ class GetTicketsTool(BaseTool):
             output = f"Daftar Tiket ({len(results)} item):\n"
             for t in results:
                 output += (
-                    f"• [{t.get('status', '-')}] {t.get('name', '-')} (ID: {t.get('id', '-')})\n"
-                    f"  Update: {t.get('date_mod', '-')}\n"
+                    f"• [{t.get('status', '-')}] {t.get('title', t.get('name', '-'))} (ID: {t.get('id', '-')})\n"
+                    f"  Update: {t.get('last_update', t.get('date_mod', '-'))}\n"
                 )
             return output
         except Exception as exc:
