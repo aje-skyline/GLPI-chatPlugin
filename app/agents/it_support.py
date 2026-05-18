@@ -22,7 +22,8 @@ from app.tools import (
     tool_get_categories,
     tool_get_suppliers,
     tool_count_all_computers,
-    tool_search_computer_by_name
+    tool_search_computer_by_name,
+    tool_search_computer,
 )
 
 # ── Agent Identity ────────────────────────────────────────────────────────────
@@ -59,6 +60,8 @@ BACKSTORY: str = (
     "• User bertanya 'komputer saya' / 'aset milik user X' → get_user_assets\n"
     "• User bertanya 'semua komputer' / 'daftar inventaris' / 'list komputer' → get_all_computers\n"
     "• User bertanya detail 1 komputer by ID → get_computer_detail\n"
+    "• User mencari komputer dengan nama/serial/inventory/code tidak jelas → search_computer\n"
+    "  (search_computer akan otomatis mencari ke 3 field: Nama, Serial, dan Inventory Number)\n"
     "• User bertanya 'kontrak' / 'contract' / 'vendor agreement' → list_all_contracts\n"
     "• User bertanya detail 1 kontrak by ID → get_contract_detail\n"
     "• User bertanya 'tiket saya' / 'request saya' → get_user_tickets\n"
@@ -72,6 +75,14 @@ BACKSTORY: str = (
     "DILARANG KERAS menampilkan: JSON raw, 'Observation:', 'Action:', 'Thought:', "
     "format internal agent, atau proses reasoning. "
     "Mulai langsung dengan jawaban dalam bahasa Indonesia yang sopan.\n\n"
+    
+    "╔══ ATURAN 5 — JANGAN UBAH KALIMAT TOOL ══╗\n"
+    "Saat tool search_computer mengembalikan kalimat seperti "
+    "'Ditemukan 1 komputer dengan nama ABC' atau "
+    "'Ditemukan 1 komputer dengan inventory number INV-001' — "
+    "WAJIB gunakan kalimat TERSEBUT APA ADANYA sebagai pembuka jawaban kamu. "
+    "JANGAN mengubahnya menjadi 'Komputer dengan serial number...' atau kalimat lain. "
+    "Tool SUDAH mendeteksi field mana yang match — ikuti saja.\n\n"
 
     "PERINGATAN KRITIS: Jika kamu menemukan dirimu menulis 'Thought:', 'Action:', "
     "atau 'Action Input:' di dalam Final Answer, itu SALAH BESAR. "
@@ -97,7 +108,8 @@ def build_it_support(llm: LLM, glpi_user_id: int = 0) -> Agent:
         tool_get_categories,
         tool_get_suppliers,
         tool_count_all_computers,
-        tool_search_computer_by_name
+        tool_search_computer_by_name,
+        tool_search_computer,
     ]
 
     return Agent(
