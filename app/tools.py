@@ -322,70 +322,34 @@ class CountAllComputersTool(BaseTool):
 # ── Search Computer by Name ───────────────────────────────────────────────────
 
 class SearchComputerByNameInput(BaseModel):
-    """Input schema for SearchComputerByNameTool."""
-    name: str = Field(
-        ...,
-        description=(
-            "Nama komputer (atau sebagian nama) yang ingin dicari. "
-            "Contoh: 'M01463L09', 'D02028', 'LAPTOP-FINANCE'."
-        ),
-    )
+    name: str = Field(..., description="Nama komputer yang ingin dicari di GLPI.")
     limit: int = Field(
-        default=5, ge=1, le=20,
-        description="Jumlah maksimum hasil yang dikembalikan (default 5).",
+        default=50, ge=1, le=200,
+        description="Jumlah maksimal hasil pencarian (default 50).",
     )
-
 
 class SearchComputerByNameTool(BaseTool):
-    """Cari komputer spesifik berdasarkan nama menggunakan GLPI Search API."""
-
     name: str = "search_computer_by_name"
     description: str = (
-        "Cari komputer SPESIFIK berdasarkan nama (atau sebagian nama) dari seluruh "
-        "inventaris GLPI menggunakan Search API — tanpa batasan jumlah record. "
-        "WAJIB gunakan tool ini saat user menyebut nama komputer tertentu "
-        "(contoh: 'M01463L09', 'D02028L07'). "
-        "Hasilnya mencakup: ID, Nama, Serial Number, Type (kategori hardware), "
-        "Model (nama produk), Status, Lokasi, User, dan data finansial. "
-        "JANGAN gunakan get_all_computers untuk mencari berdasarkan nama — "
-        "get_all_computers hanya mengambil 200 record pertama dari 20.000+ data."
+        "Cari komputer di inventaris GLPI berdasarkan namanya. "
+        "Gunakan tool ini SAAT user memberikan nama spesifik komputer."
     )
     args_schema: Type[BaseModel] = SearchComputerByNameInput
 
-    def _run(self, name: str, limit: int = 5) -> str:
-        logger.info("Tool SearchByName | name='%s' limit=%s", name, limit)
+    def _run(self, name: str, limit: int) -> str:
+        logger.info("Tool Search Computer | name=%s | limit=%s", name, limit)
         try:
-            results: list[dict[str, Any]] = _run_async(
-                it_glpi_client.search_computer_by_name(name=name, limit=limit)
-            )
+            results = _run_async(it_glpi_client.search_computer_by_name(name, limit))
             if not results:
-                return f"Komputer dengan nama yang mengandung '{name}' tidak ditemukan di GLPI."
-
-            output = f"Hasil pencarian komputer '{name}' ({len(results)} ditemukan):\n\n"
-            for comp in results:
-                output += (
-                    f"**{comp.get('name', '-')}** (ID: {comp.get('id', '-')})\n"
-                    f"  Serial Number : {comp.get('serial', '-') or '(tidak ada)'}\n"
-                    f"  Other Serial  : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
-                    f"  Type          : {comp.get('type', '-') or '(tidak ada)'}\n"
-                    f"  Model         : {comp.get('model', '-') or '(tidak ada)'}\n"
-                    f"  Status        : {comp.get('status', '-') or '(tidak ada)'}\n"
-                    f"  Lokasi        : {comp.get('location', '-') or '(tidak ada)'}\n"
-                    f"  User          : {comp.get('user', '-') or '(tidak ada)'}\n"
-                    f"  Tgl Beli      : {comp.get('buy_date', '-') or '(tidak ada)'}\n"
-                    f"  Garansi       : {comp.get('warranty_duration', '-') or '(tidak ada)'}\n"
-                    f"  Nilai Aset    : {comp.get('value', '-') or '(tidak ada)'}\n"
-                    f"  Supplier      : {comp.get('supplier', '-') or '(tidak ada)'}\n"
-                )
-                if comp.get("contracts"):
-                    output += "  Kontrak       :\n"
-                    for c in comp["contracts"]:
-                        output += f"    - {c.get('name', '-')} (ID: {c.get('id', '-')})\n"
-                output += "\n"
+                return f"Komputer dengan nama '{name}' tidak ditemukan."
+            
+            output = f"Hasil pencarian untuk '{name}':\n\n"
+            for idx, comp in enumerate(results, 1):
+                output += f"{idx}. **{comp.get('name', '-')}** (ID: {comp.get('id', '-')})\n"
             return output
         except Exception as exc:
-            logger.error("SearchComputerByName failed: %s", exc)
-            return f"Gagal mencari komputer '{name}': {exc}"
+            logger.error("Computer search failed: %s", exc)
+            return f"Gagal mencari komputer: {exc}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Contracts
@@ -651,3 +615,4 @@ tool_get_user_info       = GetUserInfoTool()
 tool_get_categories      = GetCategoriesTool()
 tool_get_suppliers       = GetSuppliersTool()
 tool_count_all_computers  = CountAllComputersTool()
+tool_search_computer_by_name = SearchComputerByNameTool()

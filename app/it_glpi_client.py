@@ -495,71 +495,50 @@ async def get_user_assets(user_id: int) -> list[dict[str, Any]]:
     return []
 
 
-async def search_computer_by_name(
-    name: str,
-    limit: int = 5,
-) -> list[dict[str, Any]]:
-    """Search computers by name using the GLPI Search API with a server-side filter.
-
-    This is the CORRECT tool for finding a specific computer by name from 20,000+
-    records.  Unlike ``get_all_computers()`` (which only fetches the first N rows),
-    this function issues a targeted search and GLPI returns only the matching rows.
-
-    Strategy:
-      1. POST a search request to ``/search/Computer`` filtering on field 2 (name).
-      2. For each matching ID, call ``get_computer_by_id`` to retrieve full details
-         (type, model, location, serial, financial data, contracts).  This guarantees
-         the ``type`` field is always populated correctly from ``computertypes_id``.
+async def search_computer_by_name(name: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Fetch computers by their name using the GLPI search API.
 
     Args:
-        name  : Computer name (or partial name) to search for.
-        limit : Maximum number of results to return (default 5).
+        name : Nama atau substring nama komputer yang dicari.
+        limit: Jumlah maksimal hasil yang dikembalikan (default 50).
 
     Returns:
-        List of computer dicts identical in shape to ``get_computer_by_id`` output.
+        List of computer dicts with id, name, serial, type, model, status.
     """
     try:
-        # Step 1: find matching computer IDs via Search API
-        search_data = await _get("/search/Computer", params={
-            "criteria[0][field]": 2,             # field 2 = name
+        params: dict[str, Any] = {
+            "criteria[0][field]": 1,          
             "criteria[0][searchtype]": "contains",
             "criteria[0][value]": name,
-            "range": f"0-{limit - 1}",
-            "forcedisplay[0]": 1,                # ID
-            "forcedisplay[1]": 2,                # Name
-        })
+            "range": f"0-{limit - 1}",        
+            "expand_dropdowns": "true",
+           
+            "forcedisplay[0]": 2,  
+            "forcedisplay[1]": 1,   
+            "forcedisplay[2]": 5,   
+            "forcedisplay[3]": 4,   
+            "forcedisplay[4]": 40,  
+            "forcedisplay[5]": 31,  
+        }
 
-        items: list[Any] = _extract_data(search_data)
-        if not items:
-            logger.info("search_computer_by_name: no results for name='%s'", name)
-            return []
+        data = await _get("/search/Computer", params=params)
+        items: list[Any] = _extract_data(data)
 
-        logger.info(
-            "search_computer_by_name: found %d match(es) for name='%s'",
-            len(items), name,
-        )
-
-        # Step 2: fetch full detail for each matched computer
-        results: list[dict[str, Any]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            computer_id_raw = _first(item, "1", "id")
-            try:
-                computer_id = int(computer_id_raw)
-            except (TypeError, ValueError):
-                continue
-            detail = await get_computer_by_id(computer_id)
-            if detail:
-                results.append(detail)
-
-        return results
-
+        return [
+            {
+                "id":     _first(item, "2", "id"),      # field 2 = ID (bukan field 1!)
+                "name":   _first(item, "1", "name"),    # field 1 = name
+                "serial": _first(item, "5", "serial"),
+                "type":   _clean_value(_first(item, "4", "computertypes_id")),
+                "model":  _clean_value(_first(item, "40", "computermodels_id", "model")),
+                "status": _clean_value(_first(item, "31", "states_id", "status")),
+            }
+            for item in items if isinstance(item, dict)
+        ]
     except Exception as exc:
-        logger.warning("search_computer_by_name failed (name='%s'): %s", name, exc)
+        logger.warning("search_computer_by_name failed: %s", exc)
         return []
- 
- 
+    
 def _first(item: dict[str, Any], *keys: str) -> Any:
     """Return the first non-empty value from ``item`` matching any of ``keys``."""
     for k in keys:
@@ -567,6 +546,8 @@ def _first(item: dict[str, Any], *keys: str) -> Any:
         if v is not None and v != "":
             return v
     return ""
+
+
 
 
 # ── Contracts ───────────────────────────────────────────────────────────────
