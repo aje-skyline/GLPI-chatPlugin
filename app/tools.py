@@ -403,9 +403,97 @@ class SearchComputerByNameTool(BaseTool):
             logger.error("Computer search failed: %s", exc)
             return f"Gagal mencari komputer: {exc}"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Contracts
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Universal Computer Search ─────────────────────────────────────────────────
+
+class SearchComputerInput(BaseModel):
+    query: str = Field(
+        ...,
+        description=(
+            "Kata kunci pencarian bebas: bisa nama komputer, serial number, "
+            "atau inventory number (nomor inventaris). Contoh: 'ABC123', 'LAPTOP-HRD', 'SN-XYZ'."
+        ),
+    )
+    limit: int = Field(
+        default=10, ge=1, le=50,
+        description="Jumlah maksimal hasil pencarian (default 10, maks 50).",
+    )
+
+
+class SearchComputerTool(BaseTool):
+    """Cari komputer di GLPI berdasarkan nama, serial number, ATAU inventory number."""
+
+    name: str = "search_computer"
+    description: str = (
+        "Cari komputer di inventaris GLPI menggunakan satu kata kunci yang dicocokkan "
+        "secara otomatis ke TIGA field sekaligus: Nama, Serial Number, dan Inventory Number. "
+        "Gunakan tool ini saat user mengetik kode/identifier yang tidak jelas field-nya, "
+        "misalnya: 'cari ABC123', 'temukan SN-XYZ', 'ada komputer INV-001?', "
+        "'cek inventory INV-001', 'cari serial SN-123', 'cari komputer LAPTOP-HRD'. "
+        "LEBIH EFISIEN dari memanggil search_computer_by_name karena satu call sudah mencakup "
+        "tiga field sekaligus. "
+        "JANGAN gunakan untuk melihat semua inventaris — gunakan get_all_computers. "
+        "PENTING: Tool ini akan mengembalikan kalimat pembuka seperti 'Ditemukan X komputer dengan [nama/serial number/inventory number]...'. "
+        "Gunakan KALIMAT PERSIS dari tool sebagai pembuka jawaban kamu. JANGAN ubah menjadi "
+        "'Komputer dengan serial number...' jika user tidak mencari berdasarkan serial."
+    )
+    args_schema: Type[BaseModel] = SearchComputerInput
+
+    def _run(self, query: str, limit: int = 10) -> str:
+        logger.info("Tool Search Computer (universal) | query='%s' | limit=%s", query, limit)
+        try:
+            results: list[dict[str, Any]] = _run_async(
+                it_glpi_client.search_computer(query, limit)
+            )
+            if not results:
+                return (
+                    f"Komputer dengan kata kunci '{query}' tidak ditemukan. "
+                    "Pencarian sudah dilakukan pada field: Nama, Serial Number, dan Inventory Number."
+                )
+
+            # Detect likely match field for smarter response phrasing
+            q = query.lower()
+            likely_field = "pencarian"  # default
+            for comp in results:
+                sn = (comp.get("serial") or "").lower()
+                inv = (comp.get("otherserial") or "").lower()
+                nm = (comp.get("name") or "").lower()
+                if q in sn and sn:
+                    likely_field = "serial number"
+                    break
+                if q in inv and inv:
+                    likely_field = "inventory number"
+                    break
+                if q in nm and nm:
+                    likely_field = "nama"
+                    break
+
+            output = f"Ditemukan {len(results)} komputer dengan {likely_field} '{query}':\n\n"
+            for idx, comp in enumerate(results, 1):
+                output += (
+                    f"{idx}. **{comp.get('name', '-')}** (ID: {comp.get('id', '-')})\n"
+                    f"   Serial   : {comp.get('serial', '-') or '(tidak ada)'}\n"
+                    f"   Inv. No  : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
+                    f"   Type     : {comp.get('type', '-') or '(tidak ada)'}\n"
+                    f"   Model    : {comp.get('model', '-') or '(tidak ada)'}\n"
+                    f"   Status   : {comp.get('status', '-') or '(tidak ada)'}\n"
+                    f"   Lokasi   : {comp.get('location', '-') or '(tidak ada)'}\n"
+                )
+                if comp.get("entity"):
+                    output += f"   Entity   : {comp['entity']}\n"
+                if comp.get("manufacturer"):
+                    output += f"   Pabrikan : {comp['manufacturer']}\n"
+                if comp.get("os"):
+                    output += f"   OS       : {comp['os']}\n"
+                if comp.get("date_mod"):
+                    output += f"   Update   : {comp['date_mod']}\n"
+                output += "\n"
+            return output
+        except Exception as exc:
+            logger.error("Universal computer search failed: %s", exc)
+            return f"Gagal mencari komputer: {exc}"
+
+
+
 
 class GetContractsInput(BaseModel):
     computer_id: int = Field(
@@ -666,5 +754,6 @@ tool_get_tickets         = GetTicketsTool()
 tool_get_user_info       = GetUserInfoTool()
 tool_get_categories      = GetCategoriesTool()
 tool_get_suppliers       = GetSuppliersTool()
-tool_count_all_computers  = CountAllComputersTool()
-tool_search_computer_by_name = SearchComputerByNameTool()
+tool_count_all_computers      = CountAllComputersTool()
+tool_search_computer_by_name  = SearchComputerByNameTool()
+tool_search_computer          = SearchComputerTool()
