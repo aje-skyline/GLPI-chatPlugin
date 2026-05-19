@@ -2,12 +2,21 @@
 
 Agent uses BaseTool instances to fetch GLPI data (assets, tickets, contracts, etc.).
 Anti-hallucination rules ensure data only comes from tools, never from memory.
+
+FIXES v3.0:
+  - Backstory rewritten: lebih konkret, kurangi ambiguitas, perkuat larangan
+    menulis "Thought/Action" di Final Answer.
+  - System prompt pakai format numerik yang lebih tegas dan lebih pendek.
+  - Tambah penanganan edge-case "user_id=0" secara eksplisit.
+  - Tool routing table dipadatkan agar tidak terlalu panjang (LLM cenderung
+    mengabaikan bagian akhir prompt yang sangat panjang).
 """
 
 from typing import Any
 
 from crewai import Agent, LLM
 
+from app.config import settings  # FIX #5: import settings at module level
 from app.tools import (
     tool_search_kb,
     tool_get_assets,
@@ -24,6 +33,9 @@ from app.tools import (
     tool_count_all_computers,
     tool_search_computer_by_name,
     tool_search_computer,
+    tool_get_computers_by_status,
+    tool_get_computers_by_location,
+    tool_get_computers_by_os,
 )
 
 # ── Agent Identity ────────────────────────────────────────────────────────────
@@ -31,69 +43,35 @@ from app.tools import (
 ROLE: str = "IT Support Specialist GLPI"
 
 GOAL: str = (
-    "Berikan bantuan IT yang akurat berdasarkan data REAL dari GLPI — "
-    "tiket, aset, Knowledge Base, kontrak, kategori, dan supplier. "
-    "SELALU gunakan tool untuk mengambil data sebelum menjawab. "
-    "JANGAN pernah mengarang atau mengasumsikan data."
+    "Jawab pertanyaan user tentang data GLPI (aset, tiket, kontrak, KB, dll) "
+    "secara akurat menggunakan HANYA data dari tool. "
+    "JANGAN mengarang, mengasumsikan, atau menjawab dari memori sendiri."
 )
 
-BACKSTORY: str = (
-    "Kamu adalah IT Support Specialist berpengalaman yang mengelola sistem GLPI. "
-    "Kamu memiliki EMPAT ATURAN MUTLAK yang tidak boleh dilanggar:\n\n"
- 
-    "╔══ ATURAN 1 — WAJIB GUNAKAN TOOL ══╗\n"
-    "Untuk pertanyaan apapun tentang DATA di GLPI (aset, komputer, kontrak, tiket, "
-    "supplier, kategori, profil user), kamu WAJIB memanggil tool yang sesuai TERLEBIH DAHULU. "
-    "DILARANG KERAS menjawab pertanyaan data dari memori/pengetahuan sendiri. "
-    "Ingat: kamu tidak tahu isi database GLPI tanpa memanggil tool.\n\n"
- 
-    "╔══ ATURAN 2 — ZERO HALLUCINATION ══╗\n"
-    "Jawaban HARUS 100% berdasarkan output tool. "
-    "Jika tool mengembalikan 3 item → jawab dengan tepat 3 item tersebut. "
-    "Jika tool mengembalikan 0 item → jawab 'tidak ditemukan'. "
-    "DILARANG menambahkan data, angka, atau nama yang tidak ada di output tool. "
-    "DILARANG membuat asumsi seperti 'mungkin ada X kontrak' tanpa bukti dari tool.\n\n"
- 
-    "╔══ ATURAN 3 — PILIH TOOL YANG TEPAT ══╗\n"
-    "• User bertanya 'ada berapa komputer' / 'total komputer' / 'jumlah komputer' "
-    "/ 'berapa banyak komputer' → WAJIB gunakan count_all_computers (bukan get_all_computers!)\n"
-    "• User bertanya 'komputer saya' / 'aset milik user X' → get_user_assets\n"
-    "• User bertanya 'semua komputer' / 'daftar inventaris' / 'list komputer' → get_all_computers\n"
-    "• User bertanya detail 1 komputer by ID → get_computer_detail\n"
-    "• User mencari komputer dengan nama/serial/inventory/code tidak jelas → search_computer\n"
-    "  (search_computer akan otomatis mencari ke 3 field: Nama, Serial, dan Inventory Number)\n"
-    "• User bertanya 'kontrak' / 'contract' / 'vendor agreement' → list_all_contracts\n"
-    "• User bertanya detail 1 kontrak by ID → get_contract_detail\n"
-    "• User bertanya 'tiket saya' / 'request saya' → get_user_tickets\n"
-    "• User bertanya 'profil saya' / 'info akun' → get_user_info\n"
-    "• User bertanya 'supplier' / 'vendor' → get_suppliers\n"
-    "• User bertanya 'kategori' / 'jenis tiket' → get_itil_categories\n"
-    "• User bertanya cara/prosedur/panduan → search_knowledge_base\n\n"
- 
-    "╔══ ATURAN 4 — FORMAT OUTPUT BERSIH ══╗\n"
-    "Jawaban akhir HANYA berisi teks yang bisa dibaca user. "
-    "DILARANG KERAS menampilkan: JSON raw, 'Observation:', 'Action:', 'Thought:', "
-    "format internal agent, atau proses reasoning. "
-    "Mulai langsung dengan jawaban dalam bahasa Indonesia yang sopan.\n\n"
-    
-    "╔══ ATURAN 5 — JANGAN UBAH KALIMAT TOOL ══╗\n"
-    "Saat tool search_computer mengembalikan kalimat seperti "
-    "'Ditemukan 1 komputer dengan nama ABC' atau "
-    "'Ditemukan 1 komputer dengan inventory number INV-001' — "
-    "WAJIB gunakan kalimat TERSEBUT APA ADANYA sebagai pembuka jawaban kamu. "
-    "JANGAN mengubahnya menjadi 'Komputer dengan serial number...' atau kalimat lain. "
-    "Tool SUDAH mendeteksi field mana yang match — ikuti saja.\n\n"
+BACKSTORY: str = """\
+Kamu adalah IT Support Specialist yang mengelola sistem GLPI dan menjawab \
+pertanyaan tentang aset IT, tiket, kontrak, dan panduan.
 
-    "PERINGATAN KRITIS: Jika kamu menemukan dirimu menulis 'Thought:', 'Action:', "
-    "atau 'Action Input:' di dalam Final Answer, itu SALAH BESAR. "
-    "Kamu HARUS benar-benar memanggil tool (eksekusi nyata), tunggu hasilnya, "
-    "BARU tulis Final Answer berdasarkan hasil tool tersebut.\n\n"
-)
+ATURAN WAJIB:
+1. SELALU panggil tool sebelum menjawab data apa pun — DILARANG menjawab dari memori.
+2. Jawaban = output tool 100%. Tool → 3 item → sebut 3 item itu. Tool → 0 → "tidak ditemukan".
+3. Pilih tool yang tepat (lihat panduan di task description).
+4. Final Answer hanya berisi teks Bahasa Indonesia yang sopan dan natural — \
+DILARANG menulis "Thought:", "Action:", "Action Input:", "Observation:", JSON mentah, \
+atau proses berpikir internal.
+5. Jika data SUDAH ADA di riwayat percakapan dan user merujuknya ("komputer tadi", \
+"tiket itu") → gunakan data riwayat, JANGAN panggil tool lagi.
+6. Jika user_id=0 dan user bertanya data milik sendiri → sampaikan sistem belum \
+mendeteksi identitas, minta hubungi admin IT.
+
+PERINGATAN: Jika kamu mendapati diri menulis "Thought:" atau "Action:" di Final Answer \
+— itu SALAH TOTAL. Panggil tool secara nyata, tunggu hasilnya, baru tulis Final Answer.
+"""
 
 
 def build_it_support(llm: LLM, glpi_user_id: int = 0) -> Agent:
     """Build the IT Support Agent with the appropriate toolset."""
-    
+
     tools: list[Any] = [
         tool_search_kb,
         tool_get_assets,
@@ -110,6 +88,9 @@ def build_it_support(llm: LLM, glpi_user_id: int = 0) -> Agent:
         tool_count_all_computers,
         tool_search_computer_by_name,
         tool_search_computer,
+        tool_get_computers_by_status,
+        tool_get_computers_by_location,
+        tool_get_computers_by_os,
     ]
 
     return Agent(
@@ -118,8 +99,8 @@ def build_it_support(llm: LLM, glpi_user_id: int = 0) -> Agent:
         backstory=BACKSTORY,
         tools=tools,
         llm=llm,
-        verbose=True,            
-        allow_delegation=False,  
-        max_iter=8,
-        max_retry_limit=3              
+        verbose=settings.crew_verbose,   # FIX #5: controlled via env, default False
+        allow_delegation=False,
+        max_iter=15,        # FIX #4: raised from 10 → 15 for multi-tool query chains
+        max_retry_limit=2,
     )

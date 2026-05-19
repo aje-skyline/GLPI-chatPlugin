@@ -22,13 +22,16 @@ class Settings(BaseSettings):
     """
 
     mock_mode: bool = False
+    # FIX #5: verbose CrewAI agent output is disabled in production by default.
+    # Set CREW_VERBOSE=true in .env to enable for local debugging.
+    crew_verbose: bool = False
     # AI Gateway (Nemotron)
     ai_gateway_url: str
     ai_gateway_base_url: str = ""
     ai_gateway_api_key: str
 
     # Model for CrewAI
-    nemotron_model: str = "qwen/qwen3-next-80b-a3b-instruct"
+    nemotron_model: str = "aj/ai"
 
     # FastAPI Gateway security
     gateway_api_key: str
@@ -62,5 +65,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
-

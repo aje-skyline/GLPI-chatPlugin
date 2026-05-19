@@ -60,6 +60,9 @@ _BASE_HEADERS: dict[str, str] = {
 # Lock is created lazily on first use so it binds to the correct event loop.
 _session_token: str | None = None
 _session_lock: asyncio.Lock | None = None
+# FIX #12: shared Future lets waiting coroutines share one in-flight init call
+# instead of each blocking on the lock (which was held during the HTTP request).
+_session_waiter: "asyncio.Future[str] | None" = None
 
 
 def _get_session_lock() -> asyncio.Lock:
@@ -181,21 +184,51 @@ async def _kill_session(token: str) -> None:
 async def _get_session_token() -> str:
     """Return the cached session token, creating one if absent.
 
-    Protected by lazy ``_session_lock``: if two coroutines arrive simultaneously
-    with ``_session_token = None``, only the first acquires the lock and calls
-    ``_init_session()``. The second then finds the token already populated and
-    returns it immediately — no duplicate sessions are created.
+    FIX #12: The lock is held ONLY for the brief read/write of ``_session_token``
+    and ``_session_waiter`` — never during the HTTP call.  All concurrent callers
+    share a single ``asyncio.Future`` so only one ``_init_session()`` call is made.
     """
-    global _session_token
-    # Fast-path: token already present, no lock needed.
+    global _session_token, _session_waiter
+
+    # Fast-path: token already present — no lock needed.
     if _session_token:
         return _session_token
-    async with _get_session_lock():
-        # Re-check after acquiring the lock: another coroutine may have
-        # already refreshed the token while we were waiting.
-        if not _session_token:
-            _session_token = await _init_session()
-    return _session_token
+
+    lock = _get_session_lock()
+    loop = asyncio.get_running_loop()
+    is_leader = False
+    waiter: "asyncio.Future[str]"
+
+    async with lock:
+        if _session_token:
+            return _session_token
+        if _session_waiter is not None:
+            # Another coroutine is already initializing — share its waiter.
+            waiter = _session_waiter
+        else:
+            # We are the "leader" coroutine that will do the HTTP call.
+            waiter = loop.create_future()
+            _session_waiter = waiter
+            is_leader = True
+    # Lock is released here — HTTP call proceeds without blocking other coroutines.
+
+    if not is_leader:
+        # Wait for the leader to complete the HTTP call.
+        return await asyncio.shield(waiter)
+
+    try:
+        token = await _init_session()
+        async with lock:
+            _session_token = token
+            _session_waiter = None
+        waiter.set_result(token)
+        return token
+    except Exception as exc:
+        async with lock:
+            _session_waiter = None
+        if not waiter.done():
+            waiter.set_exception(exc)
+        raise
  
  
 async def _get(
@@ -203,20 +236,22 @@ async def _get(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any] | list[Any]:
     """Authenticated GET request to the GLPI API.
- 
-    Uses the shared ``_http_client`` for connection pooling and automatically
-    refreshes the session token (under ``_session_lock``) on HTTP 401, then
-    retries once.
- 
+
+    FIX #12: The session-refresh on HTTP 401 no longer holds ``_session_lock``
+    during the HTTP call.  The lock is only acquired to atomically swap the token.
+
+    FIX #13: Retries with exponential back-off (1 s, 2 s) on HTTP 429 and
+    transient 5xx errors.  The 401 refresh path retries once without back-off.
+
     Args:
         path  : URL path appended to GLPI_API_BASE (e.g., '/Computer').
         params: Optional query-string parameters.
- 
+
     Returns:
         Parsed JSON response (dict or list).
     """
     global _session_token
- 
+
     async def _do_request(token: str) -> httpx.Response:
         client = await _get_http_client()
         return await client.get(
@@ -224,24 +259,45 @@ async def _get(
             headers={**_BASE_HEADERS, "Session-Token": token},
             params=params,
         )
- 
+
     token: str = await _get_session_token()
-    resp: httpx.Response = await _do_request(token)
- 
-    # Refresh session on 401 (expired) and retry once.
-    # The lock ensures only one coroutine performs the refresh even when
-    # multiple requests expire concurrently.
-    if resp.status_code == 401:
-        logger.info("GLPI session expired — refreshing and retrying")
-        async with _get_session_lock():
-            # Another coroutine may have already refreshed the token.
-            if _session_token == token:
-                _session_token = None
-                _session_token = await _init_session()
-            token = _session_token  # type: ignore[assignment]
-        resp = await _do_request(token)
- 
-    resp.raise_for_status()
+
+    # ── Retry loop with exponential back-off (FIX #13) ───────────────────────
+    _RETRYABLE = {429, 500, 502, 503, 504}
+    for attempt in range(3):
+        resp: httpx.Response = await _do_request(token)
+
+        # ── Token refresh on 401 (FIX #12: HTTP call outside lock) ──────────
+        if resp.status_code == 401:
+            logger.info("GLPI session expired — refreshing and retrying")
+            lock = _get_session_lock()
+            old_token = token
+            async with lock:
+                if _session_token == old_token:
+                    _session_token = None
+            # HTTP call outside lock:
+            new_token = await _init_session()
+            async with lock:
+                if not _session_token:
+                    _session_token = new_token
+            token = _session_token or new_token
+            resp = await _do_request(token)
+
+        if resp.status_code in _RETRYABLE and attempt < 2:
+            wait = 2 ** attempt   # 1 s, then 2 s
+            logger.warning(
+                "GLPI API returned %s — retrying in %ss (attempt %d/3)",
+                resp.status_code, wait, attempt + 1,
+            )
+            await asyncio.sleep(wait)
+            continue
+
+        resp.raise_for_status()
+        return resp.json()
+
+    # Should only reach here if all retries were exhausted (raise_for_status
+    # would have raised on the last iteration above).
+    resp.raise_for_status()  # type: ignore[possibly-undefined]
     return resp.json()
 
 # ── Assets ──────────────────────────────────────────────────────────────────
@@ -470,7 +526,7 @@ async def get_user_assets(user_id: int) -> list[dict[str, Any]]:
                 "criteria[0][field]": field_id,
                 "criteria[0][searchtype]": "equals",
                 "criteria[0][value]": user_id,
-                "range": "0-199",                         # E.1: was 0-99, raised to 199
+                "range": "0-1k",                         # E.1: was 0-99, raised to 199
                 "expand_dropdowns": "true",
                 # ── A.1 FIX: correct GLPI 11 field numbers ────────────────────
                 "forcedisplay[0]": 1,    # Name
@@ -715,6 +771,7 @@ _COMPUTER_SEARCH_FORCEDISPLAY: dict[str, int] = {
     "forcedisplay[9]":  31,   # Status
     "forcedisplay[10]": 40,   # Model
     "forcedisplay[11]": 80,   # Entity
+    "forcedisplay[12]": 24,   # User (users_id) — FIX #1: was missing, agent had no owner data
 }
 
 #: Infocom warranty expiration field ID (linked to Computer via Search API).
@@ -744,6 +801,8 @@ def _parse_computer_search_item(item: dict[str, Any]) -> dict[str, Any]:
         "model":        _clean_value(_first(item, "40", "computermodels_id", "model")),
         "status":       _clean_value(_first(item, "31", "states_id", "status")),
         "location":     _clean_value(_first(item, "3", "locations_id", "location")),
+        # FIX #1: field 24 = User (users_id) — now included in forcedisplay
+        "user":         _clean_value(_first(item, "24", "users_id", "user")),
         "entity":       _clean_value(_first(item, "80", "entities_id", "entity")),
         "manufacturer": _clean_value(_first(item, "23", "manufacturers_id", "manufacturer")),
         "os":           _clean_value(_first(item, "14", "operatingsystems_id", "os")),
@@ -1090,6 +1149,7 @@ async def fetch_knowbase_items(query: str, limit: int = 5) -> list[dict[str, Any
                 "answer": _strip_html(item.get("5") or item.get("answer", "")),
             }
             for item in items
+            if isinstance(item, dict)  # FIX #7: guard against non-dict entries
         ]
     
     except Exception as exc:
@@ -1236,6 +1296,7 @@ async def fetch_itil_categories(limit: int = 20) -> list[dict[str, Any]]:
                 "completename": item.get("16") or item.get("completename", ""),
             }
             for item in items
+            if isinstance(item, dict)  # FIX #7: guard against non-dict entries
         ]
     except Exception as exc:
         logger.warning("fetch_itil_categories failed: %s", exc)
@@ -1248,17 +1309,28 @@ async def fetch_suppliers(limit: int = 20) -> list[dict[str, Any]]:
     """Fetch suppliers / vendors from GLPI.
 
     Endpoint: GET /Supplier?expand_dropdowns=true&range=0-{limit-1}
+
+    FIX #6: now uses _extract_data (consistent with all other fetch functions)
+    and adds isinstance(item, dict) guard.
     """
     try:
         data = await _get("/Supplier", params={
             "expand_dropdowns": "true",
             "range": f"0-{limit - 1}",
         })
-        if isinstance(data, dict) and "data" in data:
-            return data["data"]  # type: ignore[return-value]
-        if isinstance(data, list):
-            return data
-        return []
+        items: list[Any] = _extract_data(data)
+        return [
+            {
+                "id": item.get("id", ""),
+                "name": item.get("name", ""),
+                "phonenumber": item.get("phonenumber", ""),
+                "website": item.get("website", ""),
+                "email": item.get("email", ""),
+                "comment": _strip_html(item.get("comment", "") or ""),
+            }
+            for item in items
+            if isinstance(item, dict)
+        ]
     except Exception as exc:
         logger.warning("fetch_suppliers failed: %s", exc)
         return []
