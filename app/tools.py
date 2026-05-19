@@ -3,19 +3,15 @@
 Each tool is a BaseTool subclass with a typed Pydantic input schema.
 Tools are called by IT Support Agent based on user intent.
 
-CHANGELOG (bug-fix v2.1):
-  ROOT CAUSE: `asyncio.run()` creates a NEW event loop and immediately CLOSES it
-  after each call. Module-level asyncio.Lock() objects in it_glpi_client.py were
-  bound to the first loop ever created. On the next tool call, a second loop was
-  spawned, the old locks were "orphaned", and httpx raised "Event loop is closed".
-  This caused every *other* request to fail silently (odd requests worked because
-  they happened to land on a fresh loop; even requests hit the closed one).
-
-  FIX: Replace ad-hoc asyncio.run() with a single, long-lived background thread
-  that runs its own event loop for the entire lifetime of the process. All tool
-  calls submit coroutines to this loop via asyncio.run_coroutine_threadsafe(),
-  which is thread-safe and reuses the same loop — so locks, httpx clients, and
-  GLPI sessions are never orphaned.
+FIXES v3.0:
+  - Tambah tiga tool baru: GetComputersByStatusTool, GetComputersByLocationTool,
+    GetComputersByOsTool — memanfaatkan fungsi client yang sudah ada tapi belum
+    di-expose sebagai tool.
+  - Fix GetAllComputersTool: hapus duplicate empty-check yang unreachable.
+  - Fix GetContractDetailTool: output sekarang terformat (bukan raw str(dict)).
+  - Fix GetCategoriesTool: output terformat, bukan raw str(list).
+  - Semua tool output menggunakan format teks yang konsisten dan mudah dibaca LLM.
+  - _run_async: timeout naik ke 45s untuk query besar.
 """
 
 import asyncio
@@ -32,10 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 # ── Persistent background event loop ─────────────────────────────────────────
-# One daemon thread owns an asyncio event loop for the entire process lifetime.
-# CrewAI tools (which run in FastAPI's thread-pool executor) submit coroutines
-# here via asyncio.run_coroutine_threadsafe() — completely thread-safe and, most
-# importantly, the loop is NEVER closed between requests.
 
 _loop: asyncio.AbstractEventLoop | None = None
 _loop_lock = threading.Lock()
@@ -58,9 +50,6 @@ def _get_loop() -> asyncio.AbstractEventLoop:
         t = threading.Thread(target=_run, args=(loop,), daemon=True, name="glpi-async-loop")
         t.start()
 
-        # Wait until loop is actually running before returning it.
-        # run_forever() is non-blocking from caller's perspective; give it a
-        # moment to enter the loop.
         import time
         deadline = time.monotonic() + 2.0
         while not loop.is_running():
@@ -73,27 +62,8 @@ def _get_loop() -> asyncio.AbstractEventLoop:
     return _loop
 
 
-def _run_async(coro: Any, timeout: float = 30.0) -> Any:
-    """Submit *coro* to the persistent background loop and block until done.
-
-    This replaces the previous asyncio.run() approach.  asyncio.run() creates a
-    brand-new loop, runs the coroutine, then **closes the loop** — which breaks
-    any asyncio primitives (Locks, Queues, Futures) that were bound to a
-    different loop.  run_coroutine_threadsafe() submits to the *existing* loop
-    without ever closing it, so all shared state in it_glpi_client survives
-    across calls.
-
-    Args:
-        coro   : Awaitable coroutine to run.
-        timeout: Seconds to wait before raising TimeoutError (default 30 s).
-
-    Returns:
-        Whatever the coroutine returns.
-
-    Raises:
-        TimeoutError : If the coroutine does not finish within *timeout* seconds.
-        Any exception raised inside the coroutine is re-raised here.
-    """
+def _run_async(coro: Any, timeout: float = 45.0) -> Any:
+    """Submit *coro* to the persistent background loop and block until done."""
     loop = _get_loop()
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     try:
@@ -103,12 +73,60 @@ def _run_async(coro: Any, timeout: float = 30.0) -> Any:
         raise TimeoutError(f"GLPI async call timed out after {timeout}s")
 
 
+# ── Shared computer detail formatter ─────────────────────────────────────────
+
+def _fmt_computer_row(idx: int, comp: dict[str, Any], detail: bool = False) -> str:
+    """Format satu komputer menjadi baris teks yang konsisten."""
+    name = comp.get("name") or "-"
+    cid = comp.get("id") or "-"
+    lines = [f"{idx}. **{name}** (ID: {cid})"]
+
+    def _add(label: str, key: str) -> None:
+        val = comp.get(key) or "(tidak ada)"
+        lines.append(f"   {label:<18}: {val}")
+
+    _add("Serial Number", "serial")
+    _add("Inventory Number", "otherserial")
+    _add("Type", "type")
+    _add("Model", "model")
+    _add("Status", "status")
+    _add("Lokasi", "location")
+    _add("User", "user")
+
+    if comp.get("entity"):
+        _add("Entity", "entity")
+    if comp.get("manufacturer"):
+        _add("Pabrikan", "manufacturer")
+    if comp.get("os"):
+        _add("OS", "os")
+    if comp.get("date_mod"):
+        _add("Terakhir Update", "date_mod")
+
+    if detail:
+        lines.append("   Data Finansial:")
+        _add("  Tgl Beli", "buy_date")
+        _add("  Tgl Pakai", "use_date")
+        warranty = comp.get("warranty_duration") or "(tidak ada)"
+        lines.append(f"   {'Garansi':<18}: {warranty} bulan")
+        if comp.get("warranty_date"):
+            _add("  Garansi Berakhir", "warranty_date")
+        _add("  Nilai Aset", "value")
+        _add("  Supplier", "supplier")
+        contracts = comp.get("contracts") or []
+        if contracts:
+            lines.append("   Kontrak terkait:")
+            for c in contracts:
+                end = c.get("end_date") or "(tidak ada)"
+                lines.append(f"     - {c.get('name', '-')} (ID: {c.get('id', '-')}) | Berakhir: {end}")
+
+    return "\n".join(lines) + "\n"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Knowledge Base
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SearchKnowledgeBaseInput(BaseModel):
-    """Input schema for SearchKnowledgeBaseTool."""
     query: str = Field(
         ...,
         description="Kata kunci pencarian artikel KB (e.g., 'reset password', 'install VPN')",
@@ -128,15 +146,15 @@ class SearchKnowledgeBaseTool(BaseTool):
         logger.info("Tool KB | query='%s'", query)
         try:
             results: list[dict[str, Any]] = _run_async(
-                it_glpi_client.fetch_knowbase_items(query, limit=3)
+                it_glpi_client.fetch_knowbase_items(query, limit=5)
             )
             if not results:
                 return "Tidak ditemukan artikel yang relevan di Knowledge Base."
 
-            output = "Hasil pencarian Knowledge Base:\n\n"
+            output = f"Hasil pencarian Knowledge Base untuk '{query}':\n\n"
             for idx, item in enumerate(results, 1):
-                title: str = item.get("title", "")
-                answer: str = item.get("answer", "")[:400]
+                title: str = item.get("title") or "(tanpa judul)"
+                answer: str = (item.get("answer") or "")[:500]
                 output += f"{idx}. **{title}**\n{answer}...\n\n"
             return output
         except Exception as exc:
@@ -149,55 +167,36 @@ class SearchKnowledgeBaseTool(BaseTool):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GetUserAssetsInput(BaseModel):
-    """Input schema for GetUserAssetsTool."""
-    user_id: int = Field(
-        ...,
-        ge=0,
-        description="ID user GLPI. Jika tidak tahu atau ID adalah 0, kirim 0.",
-    )
+    user_id: int = Field(..., ge=0, description="ID user GLPI. Gunakan 0 jika tidak diketahui.")
 
 class GetUserAssetsTool(BaseTool):
     """Ambil daftar komputer milik user dari GLPI."""
     name: str = "get_user_assets"
     description: str = (
         "Ambil daftar aset komputer yang DIMILIKI atau DITUGASKAN kepada user tertentu. "
-        "HANYA gunakan tool ini saat user bertanya tentang komputer miliknya sendiri "
+        "HANYA gunakan saat user bertanya tentang komputer miliknya sendiri "
         "atau milik user spesifik lainnya. "
-        "JANGAN gunakan untuk pertanyaan tentang semua inventaris — gunakan get_all_computers."
+        "JANGAN gunakan untuk semua inventaris — gunakan get_all_computers."
     )
     args_schema: Type[BaseModel] = GetUserAssetsInput
 
     def _run(self, user_id: int) -> str:
         if user_id <= 0:
-            return "Sistem: ID User Anda 0 (belum terdeteksi). Mohon tanyakan ID atau nama kepada User agar bisa mencari asetnya."
-
+            return (
+                "Sistem tidak dapat menemukan aset: ID User belum terdeteksi (user_id=0). "
+                "Pastikan user sudah login dengan benar atau hubungi admin IT."
+            )
         logger.info("Tool Asset | user_id=%s", user_id)
         try:
             results: list[dict[str, Any]] = _run_async(
                 it_glpi_client.get_user_assets(user_id)
             )
             if not results:
-                return "User tidak memiliki aset komputer yang terdaftar."
+                return f"User ID {user_id} tidak memiliki aset komputer yang terdaftar di GLPI."
 
-            output = f"Daftar aset komputer user ({len(results)} item):\n\n"
+            output = f"Daftar aset komputer user ID {user_id} ({len(results)} item):\n\n"
             for idx, item in enumerate(results, 1):
-                output += (
-                    f"{idx}. **{item.get('name', '-')}**\n"
-                    f"   ID               : {item.get('id', '-')}\n"
-                    f"   Serial Number    : {item.get('serial', '-') or '(tidak ada)'}\n"
-                    f"   Inventory Number : {item.get('otherserial', '-') or '(tidak ada)'}\n"
-                    f"   Type             : {item.get('type', '-') or '(tidak ada)'}\n"
-                    f"   Model            : {item.get('model', '-') or '(tidak ada)'}\n"
-                    f"   Status           : {item.get('status', '-') or '(tidak ada)'}\n"
-                    f"   Lokasi           : {item.get('location', '-') or '(tidak ada)'}\n"
-                )
-                if item.get("entity"):
-                    output += f"   Entity           : {item['entity']}\n"
-                if item.get("manufacturer"):
-                    output += f"   Pabrikan         : {item['manufacturer']}\n"
-                if item.get("os"):
-                    output += f"   OS               : {item['os']}\n"
-                output += "\n"
+                output += _fmt_computer_row(idx, item)
             return output
         except Exception as exc:
             logger.error("Asset fetch failed: %s", exc)
@@ -205,27 +204,23 @@ class GetUserAssetsTool(BaseTool):
 
 
 class GetAllComputersInput(BaseModel):
-    """Input schema for GetAllComputersTool."""
     limit: int = Field(
-        default=50, ge=1, le=200,
-        description="Jumlah maksimum komputer yang dikembalikan (default 50, maks 200).",
+        default=50, ge=1, le=100000,
+        description="Jumlah maksimum komputer yang dikembalikan (default 50).",
     )
     has_serial: bool = Field(
         default=False,
-        description=(
-            "Jika True, hanya kembalikan komputer yang memiliki serial number. "
-            "Gunakan saat user bertanya tentang komputer yang punya serial number."
-        ),
+        description="Jika True, hanya kembalikan komputer yang memiliki serial number.",
     )
 
 class GetAllComputersTool(BaseTool):
     """Ambil semua komputer di GLPI (untuk IT Admin)."""
     name: str = "get_all_computers"
     description: str = (
-        "Ambil daftar SEMUA komputer yang terdaftar di inventaris GLPI (urut dari ID terkecil). "
-        "Gunakan untuk: menelusuri inventaris umum, atau melihat daftar komputer tanpa filter nama. "
-        "JANGAN gunakan untuk mencari komputer berdasarkan nama — gunakan search_computer_by_name. "
-        "JANGAN gunakan untuk mencari aset milik user tertentu — gunakan get_user_assets."
+        "Ambil daftar SEMUA komputer yang terdaftar di inventaris GLPI. "
+        "Gunakan untuk: menelusuri inventaris umum atau melihat daftar lengkap komputer. "
+        "JANGAN gunakan untuk mencari komputer by nama/serial — gunakan search_computer. "
+        "JANGAN gunakan untuk aset milik user tertentu — gunakan get_user_assets."
     )
     args_schema: Type[BaseModel] = GetAllComputersInput
 
@@ -233,14 +228,11 @@ class GetAllComputersTool(BaseTool):
         logger.info("Tool All Computers | limit=%s | has_serial=%s", limit, has_serial)
         try:
             results: list[dict[str, Any]] = _run_async(
-                # E.2: has_serial now passed to client for server-side filtering
                 it_glpi_client.get_all_computers(limit=limit, has_serial=has_serial)
             )
             if not results:
-                return "Tidak ada komputer ditemukan."
-
-            if not results:
-                return "Tidak ada komputer yang memiliki serial number."
+                label_empty = "komputer dengan serial number" if has_serial else "komputer"
+                return f"Tidak ada {label_empty} ditemukan di GLPI."
 
             label = (
                 f"komputer dengan serial number ({len(results)} item)"
@@ -249,29 +241,11 @@ class GetAllComputersTool(BaseTool):
             )
             output = f"Daftar {label}:\n\n"
             for idx, comp in enumerate(results, 1):
-                output += (
-                    f"{idx}. **{comp.get('name', '-')}** (ID: {comp.get('id', '-')})\n"
-                    f"   Serial   : {comp.get('serial', '-') or '(tidak ada)'}\n"
-                    f"   Inv. No  : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
-                    f"   Type     : {comp.get('type', '-') or '(tidak ada)'}\n"
-                    f"   Model    : {comp.get('model', '-') or '(tidak ada)'}\n"
-                    f"   Status   : {comp.get('status', '-') or '(tidak ada)'}\n"
-                    f"   Lokasi   : {comp.get('location', '-') or '(tidak ada)'}\n"
-                    f"   User     : {comp.get('user', '-') or '(tidak ada)'}\n"
-                )
-                if comp.get("entity"):
-                    output += f"   Entity   : {comp['entity']}\n"
-                if comp.get("manufacturer"):
-                    output += f"   Pabrikan : {comp['manufacturer']}\n"
-                if comp.get("os"):
-                    output += f"   OS       : {comp['os']}\n"
-                if comp.get("date_mod"):
-                    output += f"   Update   : {comp['date_mod']}\n"
-                output += "\n"
+                output += _fmt_computer_row(idx, comp)
             return output
         except Exception as exc:
             logger.error("Computer list failed: %s", exc)
-            return f"Gagal mengambil komputer: {exc}"
+            return f"Gagal mengambil daftar komputer: {exc}"
 
 
 class GetComputerDetailInput(BaseModel):
@@ -282,9 +256,8 @@ class GetComputerDetailTool(BaseTool):
     description: str = (
         "Ambil detail LENGKAP satu komputer berdasarkan ID-nya, termasuk Type, Model, "
         "Serial Number, Lokasi, Status, data finansial, dan kontrak terkait. "
-        "WAJIB dipanggil saat user meminta 'data lengkap', 'data jelas', 'data detail', "
-        "'info lengkap', atau 'semua informasi' suatu komputer — "
-        "MESKIPUN nama komputer sudah pernah disebut di riwayat percakapan sebelumnya."
+        "WAJIB dipanggil saat user meminta 'data lengkap', 'detail', atau 'info lengkap' "
+        "suatu komputer — meskipun nama komputer sudah ada di riwayat percakapan."
     )
     args_schema: Type[BaseModel] = GetComputerDetailInput
 
@@ -292,44 +265,8 @@ class GetComputerDetailTool(BaseTool):
         try:
             comp = _run_async(it_glpi_client.get_computer_by_id(computer_id))
             if not comp:
-                return f"Komputer dengan ID {computer_id} tidak ditemukan."
-
-            output = f"Detail Komputer **{comp.get('name', '-')}** (ID: {computer_id}):\n\n"
-            output += f"  Nama             : {comp.get('name', '-') or '(tidak ada)'}\n"
-            output += f"  Serial Number    : {comp.get('serial', '-') or '(tidak ada)'}\n"
-            output += f"  Inventory Number : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
-            output += f"  Type             : {comp.get('type', '-') or '(tidak ada)'}\n"
-            output += f"  Model            : {comp.get('model', '-') or '(tidak ada)'}\n"
-            output += f"  Status           : {comp.get('status', '-') or '(tidak ada)'}\n"
-            output += f"  Lokasi           : {comp.get('location', '-') or '(tidak ada)'}\n"
-            output += f"  User             : {comp.get('user', '-') or '(tidak ada)'}\n"
-            # B: enrichment fields
-            if comp.get("entity"):
-                output += f"  Entity           : {comp['entity']}\n"
-            if comp.get("manufacturer"):
-                output += f"  Pabrikan         : {comp['manufacturer']}\n"
-            if comp.get("os"):
-                output += f"  OS               : {comp['os']}\n"
-            if comp.get("contact"):
-                output += f"  Alt. Username    : {comp['contact']}\n"
-            if comp.get("comment"):
-                output += f"  Keterangan       : {comp['comment']}\n"
-            if comp.get("date_mod"):
-                output += f"  Last Update      : {comp['date_mod']}\n"
-            output += "\nData Finansial:\n"
-            output += f"  Tgl Beli         : {comp.get('buy_date', '-') or '(tidak ada)'}\n"
-            output += f"  Tgl Pakai        : {comp.get('use_date', '-') or '(tidak ada)'}\n"
-            output += f"  Garansi          : {comp.get('warranty_duration', '-') or '(tidak ada)'} bulan\n"
-            if comp.get("warranty_date"):
-                output += f"  Garansi Berakhir : {comp['warranty_date']}\n"
-            output += f"  Nilai Aset       : {comp.get('value', '-') or '(tidak ada)'}\n"
-            output += f"  Supplier         : {comp.get('supplier', '-') or '(tidak ada)'}\n"
-            if comp.get("contracts"):
-                output += "\nKontrak terkait:\n"
-                for c in comp["contracts"]:
-                    end = c.get("end_date") or "(tidak ada)"
-                    output += f"  - {c.get('name', '-')} (ID: {c.get('id', '-')}) | Berakhir: {end}\n"
-            return output
+                return f"Komputer dengan ID {computer_id} tidak ditemukan di GLPI."
+            return f"Detail Komputer (ID: {computer_id}):\n\n" + _fmt_computer_row(1, comp, detail=True)
         except Exception as exc:
             return f"Gagal mengambil detail komputer: {exc}"
 
@@ -341,100 +278,66 @@ class CountAllComputersTool(BaseTool):
     name: str = "count_all_computers"
     description: str = (
         "Ambil TOTAL atau JUMLAH KESELURUHAN komputer yang ada di GLPI. "
-        "Gunakan tool ini HANYA jika ditanya 'ada berapa', 'jumlah', atau 'total' komputer. "
-        "Jangan gunakan tool ini jika user meminta nama atau daftar spesifik."
+        "Gunakan HANYA jika ditanya 'ada berapa', 'jumlah', atau 'total' komputer. "
+        "Jangan gunakan jika user meminta nama atau daftar spesifik."
     )
     args_schema: Type[BaseModel] = CountAllComputersInput
 
-    def _run(self, **kwargs)-> str:
+    def _run(self, **kwargs) -> str:
         try:
             total = _run_async(it_glpi_client.get_total_computers_count())
-            return f"Total komputer yang terdaftar di sistem adalah {total} unit."
+            return f"Total komputer yang terdaftar di sistem GLPI adalah {total} unit."
         except Exception as exc:
             return f"Gagal menghitung jumlah komputer: {exc}"
 
 
-# ── Search Computer by Name ───────────────────────────────────────────────────
-
 class SearchComputerByNameInput(BaseModel):
     name: str = Field(..., description="Nama komputer yang ingin dicari di GLPI.")
-    limit: int = Field(
-        default=50, ge=1, le=200,
-        description="Jumlah maksimal hasil pencarian (default 50).",
-    )
+    limit: int = Field(default=50, ge=1, le=200, description="Jumlah maksimal hasil pencarian.")
 
 class SearchComputerByNameTool(BaseTool):
     name: str = "search_computer_by_name"
     description: str = (
         "Cari komputer di inventaris GLPI berdasarkan namanya. "
-        "Gunakan tool ini SAAT user memberikan nama spesifik komputer."
+        "Gunakan saat user memberikan nama spesifik komputer. "
+        "Lebih baik gunakan search_computer yang juga mencakup serial dan inventory number."
     )
     args_schema: Type[BaseModel] = SearchComputerByNameInput
 
     def _run(self, name: str, limit: int = 50) -> str:
-        logger.info("Tool Search Computer | name=%s | limit=%s", name, limit)
+        logger.info("Tool Search Computer By Name | name=%s | limit=%s", name, limit)
         try:
             results = _run_async(it_glpi_client.search_computer_by_name(name, limit))
             if not results:
-                return f"Komputer dengan nama '{name}' tidak ditemukan."
+                return f"Komputer dengan nama '{name}' tidak ditemukan di GLPI."
 
-            output = f"Hasil pencarian '{name}' ({len(results)} item):\n\n"
+            output = f"Hasil pencarian nama '{name}' ({len(results)} item):\n\n"
             for idx, comp in enumerate(results, 1):
-                output += (
-                    f"{idx}. **{comp.get('name', '-')}** (ID: {comp.get('id', '-')})\n"
-                    f"   Serial   : {comp.get('serial', '-') or '(tidak ada)'}\n"
-                    f"   Inv. No  : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
-                    f"   Type     : {comp.get('type', '-') or '(tidak ada)'}\n"
-                    f"   Model    : {comp.get('model', '-') or '(tidak ada)'}\n"
-                    f"   Status   : {comp.get('status', '-') or '(tidak ada)'}\n"
-                    f"   Lokasi   : {comp.get('location', '-') or '(tidak ada)'}\n"
-                )
-                if comp.get("entity"):
-                    output += f"   Entity   : {comp['entity']}\n"
-                if comp.get("manufacturer"):
-                    output += f"   Pabrikan : {comp['manufacturer']}\n"
-                if comp.get("os"):
-                    output += f"   OS       : {comp['os']}\n"
-                if comp.get("date_mod"):
-                    output += f"   Update   : {comp['date_mod']}\n"
-                output += "\n"
+                output += _fmt_computer_row(idx, comp)
             return output
         except Exception as exc:
-            logger.error("Computer search failed: %s", exc)
+            logger.error("Computer search by name failed: %s", exc)
             return f"Gagal mencari komputer: {exc}"
 
-# ── Universal Computer Search ─────────────────────────────────────────────────
 
 class SearchComputerInput(BaseModel):
     query: str = Field(
         ...,
         description=(
             "Kata kunci pencarian bebas: bisa nama komputer, serial number, "
-            "atau inventory number (nomor inventaris). Contoh: 'ABC123', 'LAPTOP-HRD', 'SN-XYZ'."
+            "atau inventory number. Contoh: 'ABC123', 'LAPTOP-HRD', 'SN-XYZ'."
         ),
     )
-    limit: int = Field(
-        default=10, ge=1, le=50,
-        description="Jumlah maksimal hasil pencarian (default 10, maks 50).",
-    )
-
+    limit: int = Field(default=10, ge=1, le=50, description="Jumlah maksimal hasil (default 10).")
 
 class SearchComputerTool(BaseTool):
     """Cari komputer di GLPI berdasarkan nama, serial number, ATAU inventory number."""
-
     name: str = "search_computer"
     description: str = (
-        "Cari komputer di inventaris GLPI menggunakan satu kata kunci yang dicocokkan "
-        "secara otomatis ke TIGA field sekaligus: Nama, Serial Number, dan Inventory Number. "
-        "Gunakan tool ini saat user mengetik kode/identifier yang tidak jelas field-nya, "
-        "misalnya: 'cari ABC123', 'temukan SN-XYZ', 'ada komputer INV-001?', "
-        "'cek inventory INV-001', 'cari serial SN-123', 'cari komputer LAPTOP-HRD'. "
-        "LEBIH EFISIEN dari memanggil search_computer_by_name karena satu call sudah mencakup "
-        "tiga field sekaligus. "
-        "JANGAN gunakan untuk melihat semua inventaris — gunakan get_all_computers. "
-        "PENTING: Tool ini akan mengembalikan kalimat pembuka seperti 'Ditemukan X komputer dengan [nama/serial number/inventory number]...'. "
-        "Gunakan KALIMAT PERSIS dari tool sebagai pembuka jawaban kamu. JANGAN ubah menjadi "
-        "'Komputer dengan serial number...' jika user tidak mencari berdasarkan serial."
+        "Cari komputer di GLPI menggunakan satu kata kunci yang dicocokkan secara "
+        "otomatis ke TIGA field sekaligus: Nama, Serial Number, dan Inventory Number. "
+        "Gunakan saat user mengetik kode/identifier yang tidak jelas field-nya. "
+        "LEBIH EFISIEN dari search_computer_by_name karena satu call sudah mencakup tiga field."
     )
     args_schema: Type[BaseModel] = SearchComputerInput
 
@@ -446,54 +349,127 @@ class SearchComputerTool(BaseTool):
             )
             if not results:
                 return (
-                    f"Komputer dengan kata kunci '{query}' tidak ditemukan. "
-                    "Pencarian sudah dilakukan pada field: Nama, Serial Number, dan Inventory Number."
+                    f"Komputer dengan kata kunci '{query}' tidak ditemukan di GLPI. "
+                    "(Pencarian sudah dilakukan pada field: Nama, Serial Number, Inventory Number)"
                 )
 
-            # Detect likely match field for smarter response phrasing
+            # Deteksi field yang kemungkinan cocok
             q = query.lower()
-            likely_field = "pencarian"  # default
+            likely_field = "pencarian"
             for comp in results:
                 sn = (comp.get("serial") or "").lower()
                 inv = (comp.get("otherserial") or "").lower()
                 nm = (comp.get("name") or "").lower()
-                if q in sn and sn:
+                if sn and q in sn:
                     likely_field = "serial number"
                     break
-                if q in inv and inv:
+                if inv and q in inv:
                     likely_field = "inventory number"
                     break
-                if q in nm and nm:
+                if nm and q in nm:
                     likely_field = "nama"
                     break
 
             output = f"Ditemukan {len(results)} komputer dengan {likely_field} '{query}':\n\n"
             for idx, comp in enumerate(results, 1):
-                output += (
-                    f"{idx}. **{comp.get('name', '-')}** (ID: {comp.get('id', '-')})\n"
-                    f"   Serial   : {comp.get('serial', '-') or '(tidak ada)'}\n"
-                    f"   Inv. No  : {comp.get('otherserial', '-') or '(tidak ada)'}\n"
-                    f"   Type     : {comp.get('type', '-') or '(tidak ada)'}\n"
-                    f"   Model    : {comp.get('model', '-') or '(tidak ada)'}\n"
-                    f"   Status   : {comp.get('status', '-') or '(tidak ada)'}\n"
-                    f"   Lokasi   : {comp.get('location', '-') or '(tidak ada)'}\n"
-                )
-                if comp.get("entity"):
-                    output += f"   Entity   : {comp['entity']}\n"
-                if comp.get("manufacturer"):
-                    output += f"   Pabrikan : {comp['manufacturer']}\n"
-                if comp.get("os"):
-                    output += f"   OS       : {comp['os']}\n"
-                if comp.get("date_mod"):
-                    output += f"   Update   : {comp['date_mod']}\n"
-                output += "\n"
+                output += _fmt_computer_row(idx, comp)
             return output
         except Exception as exc:
             logger.error("Universal computer search failed: %s", exc)
             return f"Gagal mencari komputer: {exc}"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW: Filter Tools — Status, Location, OS
+# ══════════════════════════════════════════════════════════════════════════════
 
+class GetComputersByStatusInput(BaseModel):
+    status: str = Field(..., description="Status komputer yang dicari, mis: 'aktif', 'rusak', 'disposed'.")
+    limit: int = Field(default=50, ge=1, le=200, description="Jumlah maksimal hasil.")
+
+class GetComputersByStatusTool(BaseTool):
+    name: str = "get_computers_by_status"
+    description: str = (
+        "Cari komputer di GLPI yang memiliki status tertentu. "
+        "Contoh query: 'komputer yang rusak', 'komputer status aktif', 'aset disposed'. "
+        "Pencarian case-insensitive dan partial match."
+    )
+    args_schema: Type[BaseModel] = GetComputersByStatusInput
+
+    def _run(self, status: str, limit: int = 50) -> str:
+        logger.info("Tool Computers By Status | status='%s' | limit=%s", status, limit)
+        try:
+            results = _run_async(it_glpi_client.get_computers_by_status(status, limit))
+            if not results:
+                return f"Tidak ada komputer dengan status '{status}' ditemukan di GLPI."
+            output = f"Komputer dengan status '{status}' ({len(results)} item):\n\n"
+            for idx, comp in enumerate(results, 1):
+                output += _fmt_computer_row(idx, comp)
+            return output
+        except Exception as exc:
+            logger.error("Computers by status failed: %s", exc)
+            return f"Gagal mencari komputer by status: {exc}"
+
+
+class GetComputersByLocationInput(BaseModel):
+    location: str = Field(..., description="Nama lokasi yang dicari, mis: 'lantai 3', 'gedung A', 'server room'.")
+    limit: int = Field(default=50, ge=1, le=200, description="Jumlah maksimal hasil.")
+
+class GetComputersByLocationTool(BaseTool):
+    name: str = "get_computers_by_location"
+    description: str = (
+        "Cari komputer di GLPI berdasarkan lokasi fisiknya. "
+        "Contoh query: 'komputer di lantai 2', 'aset di gedung B', 'komputer server room'. "
+        "Pencarian case-insensitive dan partial match."
+    )
+    args_schema: Type[BaseModel] = GetComputersByLocationInput
+
+    def _run(self, location: str, limit: int = 50) -> str:
+        logger.info("Tool Computers By Location | location='%s' | limit=%s", location, limit)
+        try:
+            results = _run_async(it_glpi_client.get_computers_by_location(location, limit))
+            if not results:
+                return f"Tidak ada komputer di lokasi '{location}' ditemukan di GLPI."
+            output = f"Komputer di lokasi '{location}' ({len(results)} item):\n\n"
+            for idx, comp in enumerate(results, 1):
+                output += _fmt_computer_row(idx, comp)
+            return output
+        except Exception as exc:
+            logger.error("Computers by location failed: %s", exc)
+            return f"Gagal mencari komputer by lokasi: {exc}"
+
+
+class GetComputersByOsInput(BaseModel):
+    os: str = Field(..., description="Nama OS yang dicari, mis: 'Windows 10', 'Ubuntu', 'Windows Server'.")
+    limit: int = Field(default=50, ge=1, le=200, description="Jumlah maksimal hasil.")
+
+class GetComputersByOsTool(BaseTool):
+    name: str = "get_computers_by_os"
+    description: str = (
+        "Cari komputer di GLPI berdasarkan sistem operasi (OS) yang terinstall. "
+        "Contoh query: 'komputer Windows 10', 'laptop Ubuntu', 'server Windows Server 2019'. "
+        "Pencarian case-insensitive dan partial match."
+    )
+    args_schema: Type[BaseModel] = GetComputersByOsInput
+
+    def _run(self, os: str, limit: int = 50) -> str:
+        logger.info("Tool Computers By OS | os='%s' | limit=%s", os, limit)
+        try:
+            results = _run_async(it_glpi_client.get_computers_by_os(os, limit))
+            if not results:
+                return f"Tidak ada komputer dengan OS '{os}' ditemukan di GLPI."
+            output = f"Komputer dengan OS '{os}' ({len(results)} item):\n\n"
+            for idx, comp in enumerate(results, 1):
+                output += _fmt_computer_row(idx, comp)
+            return output
+        except Exception as exc:
+            logger.error("Computers by OS failed: %s", exc)
+            return f"Gagal mencari komputer by OS: {exc}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Contracts
+# ══════════════════════════════════════════════════════════════════════════════
 
 class GetContractsInput(BaseModel):
     computer_id: int = Field(
@@ -519,7 +495,7 @@ class GetContractsTool(BaseTool):
                 it_glpi_client.get_contracts(computer_id=computer_id)
             )
             if not results:
-                return "Tidak ada kontrak ditemukan."
+                return "Tidak ada kontrak ditemukan di GLPI."
 
             if active_only:
                 import datetime
@@ -528,18 +504,17 @@ class GetContractsTool(BaseTool):
                     c for c in results
                     if not c.get("end_date") or c.get("end_date", "") >= today
                 ]
-
-            if not results:
-                return "Tidak ada kontrak aktif ditemukan."
+                if not results:
+                    return "Tidak ada kontrak aktif ditemukan."
 
             output = f"Daftar kontrak ({len(results)} item):\n\n"
             for c in results:
                 output += (
-                    f"• **{c.get('name', '-')}** (ID: {c.get('id', '-')})\n"
-                    f"  Nomor   : {c.get('num', '-') or '(tidak ada)'}\n"
-                    f"  Supplier: {c.get('supplier', '-') or '(tidak ada)'}\n"
-                    f"  Mulai   : {c.get('begin_date', '-') or '(tidak ada)'}\n"
-                    f"  Berakhir: {c.get('end_date', '-') or '(tidak ada)'}\n\n"
+                    f"• **{c.get('name') or '-'}** (ID: {c.get('id') or '-'})\n"
+                    f"  Nomor    : {c.get('num') or '(tidak ada)'}\n"
+                    f"  Supplier : {c.get('supplier') or '(tidak ada)'}\n"
+                    f"  Mulai    : {c.get('begin_date') or '(tidak ada)'}\n"
+                    f"  Berakhir : {c.get('end_date') or '(tidak ada)'}\n\n"
                 )
             return output
         except Exception as exc:
@@ -556,8 +531,20 @@ class GetContractDetailTool(BaseTool):
 
     def _run(self, contract_id: int) -> str:
         try:
-            comp = _run_async(it_glpi_client.get_contract_by_id(contract_id))
-            return str(comp) if comp else f"Kontrak ID {contract_id} tidak ditemukan."
+            c = _run_async(it_glpi_client.get_contract_by_id(contract_id))
+            if not c:
+                return f"Kontrak dengan ID {contract_id} tidak ditemukan di GLPI."
+            output = f"Detail Kontrak (ID: {contract_id}):\n\n"
+            output += f"  Nama     : {c.get('name') or '-'}\n"
+            output += f"  Nomor    : {c.get('num') or '(tidak ada)'}\n"
+            output += f"  Supplier : {c.get('supplier') or '(tidak ada)'}\n"
+            output += f"  Tipe     : {c.get('type') or '(tidak ada)'}\n"
+            output += f"  Mulai    : {c.get('begin_date') or '(tidak ada)'}\n"
+            output += f"  Durasi   : {c.get('duration') or '(tidak ada)'} bulan\n"
+            output += f"  Berakhir : {c.get('end_date') or '(tidak ada)'}\n"
+            if c.get("comment"):
+                output += f"  Catatan  : {c['comment']}\n"
+            return output
         except Exception as exc:
             return f"Gagal mengambil detail kontrak: {exc}"
 
@@ -585,9 +572,15 @@ class GetMultipleItemsTool(BaseTool):
                 items.append({"itemtype": itemtype.strip(), "items_id": int(items_id.strip())})
 
             if not items:
-                return "Format query tidak valid."
+                return "Format query tidak valid. Gunakan format: 'Computer:1,Contract:2'"
             results = _run_async(it_glpi_client.get_multiple_items(items))
-            return str(results) if results else "Data tidak ditemukan."
+            if not results:
+                return "Data tidak ditemukan."
+            # Format output sebagai teks bersih
+            lines = []
+            for r in results:
+                lines.append(f"• {r.get('itemtype', '-')} ID {r.get('id', '-')}: {r.get('name', '-')}")
+            return "Hasil:\n" + "\n".join(lines)
         except Exception as exc:
             return f"Gagal: {exc}"
 
@@ -606,10 +599,10 @@ class ListSearchOptionsTool(BaseTool):
             if not data:
                 return f"Tidak ada opsi pencarian untuk {itemtype}."
 
-            output = f"Opsi pencarian {itemtype}:\n"
+            output = f"Opsi pencarian {itemtype} (30 pertama):\n"
             for field_id, info in list(data.items())[:30]:
                 if isinstance(info, dict):
-                    output += f" [{field_id}] {info.get('name', '-')} - {info.get('table', '-')}\n"
+                    output += f"  [{field_id}] {info.get('name', '-')} - {info.get('table', '-')}.{info.get('field', '-')}\n"
             return output
         except Exception as exc:
             return f"Gagal: {exc}"
@@ -620,12 +613,7 @@ class ListSearchOptionsTool(BaseTool):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GetTicketsInput(BaseModel):
-    """Input schema for GetTicketsTool."""
-    user_id: int = Field(
-        ...,
-        ge=0,
-        description="ID user GLPI. Jika tidak tahu atau ID adalah 0, kirim 0.",
-    )
+    user_id: int = Field(..., ge=0, description="ID user GLPI.")
 
 class GetTicketsTool(BaseTool):
     """Ambil daftar tiket IT milik user dari GLPI."""
@@ -638,22 +626,30 @@ class GetTicketsTool(BaseTool):
 
     def _run(self, user_id: int) -> str:
         if user_id <= 0:
-            return "Sistem: ID User Anda 0 (belum terdeteksi). Mohon tanyakan ID atau nama kepada User agar bisa mencari tiketnya."
-
+            return (
+                "Sistem tidak dapat menampilkan tiket: ID User belum terdeteksi (user_id=0). "
+                "Pastikan user sudah login dengan benar atau hubungi admin IT."
+            )
         logger.info("Tool Ticket | user_id=%s", user_id)
         try:
             results: list[dict[str, Any]] = _run_async(
                 it_glpi_client.fetch_user_tickets(user_id)
             )
             if not results:
-                return "Tidak ada tiket ditemukan untuk user ini."
+                return f"Tidak ada tiket ditemukan untuk user ID {user_id}."
 
-            output = f"Daftar Tiket ({len(results)} item):\n"
+            output = f"Daftar Tiket user ID {user_id} ({len(results)} item):\n\n"
             for t in results:
-                output += (
-                    f"• [{t.get('status', '-')}] {t.get('title', t.get('name', '-'))} (ID: {t.get('id', '-')})\n"
-                    f"  Update: {t.get('last_update', t.get('date_mod', '-'))}\n"
-                )
+                title = t.get("title") or t.get("name") or "-"
+                status = t.get("status") or "-"
+                last_update = t.get("last_update") or t.get("date_mod") or "-"
+                tid = t.get("id") or "-"
+                content = t.get("content") or ""
+                output += f"• [{status}] {title} (ID: {tid})\n"
+                output += f"  Update terakhir: {last_update}\n"
+                if content:
+                    output += f"  Ringkasan: {content[:200]}\n"
+                output += "\n"
             return output
         except Exception as exc:
             logger.error("Ticket fetch failed: %s", exc)
@@ -661,12 +657,7 @@ class GetTicketsTool(BaseTool):
 
 
 class GetUserInfoInput(BaseModel):
-    """Input schema for GetUserInfoTool."""
-    user_id: int = Field(
-        ...,
-        ge=0,
-        description="ID user GLPI. Jika tidak tahu atau ID adalah 0, kirim 0.",
-    )
+    user_id: int = Field(..., ge=0, description="ID user GLPI.")
 
 class GetUserInfoTool(BaseTool):
     """Ambil detail informasi profile user."""
@@ -676,20 +667,27 @@ class GetUserInfoTool(BaseTool):
 
     def _run(self, user_id: int) -> str:
         if user_id <= 0:
-            return "Sistem: ID User Anda 0 (belum terdeteksi). Mohon tanyakan ID atau nama kepada User agar bisa mencari profilnya."
-
+            return (
+                "Sistem tidak dapat menampilkan profil: ID User belum terdeteksi (user_id=0). "
+                "Pastikan user sudah login dengan benar atau hubungi admin IT."
+            )
         logger.info("Tool User Info | user_id=%s", user_id)
         try:
             user = _run_async(it_glpi_client.fetch_user_info(user_id))
             if not user:
-                return f"User dengan ID {user_id} tidak ditemukan."
+                return f"User dengan ID {user_id} tidak ditemukan di GLPI."
 
-            output = f"Profil User (ID: {user_id}):\n"
-            output += f"• Nama  : {user.get('name', '-')}\n"
+            output = f"Profil User (ID: {user_id}):\n\n"
+            output += f"  Nama Lengkap : {user.get('name') or '-'}\n"
+            if user.get("firstname"):
+                output += f"  Nama Depan   : {user['firstname']}\n"
+            if user.get("realname"):
+                output += f"  Nama Belakang: {user['realname']}\n"
+            output += f"  Username     : {user.get('login') or '-'}\n"
             if user.get("email"):
-                output += f"• Email : {user.get('email', '-')}\n"
+                output += f"  Email        : {user['email']}\n"
             if user.get("groups"):
-                output += f"• Grup  : {', '.join(user['groups'])}\n"
+                output += f"  Grup         : {', '.join(user['groups'])}\n"
             return output
         except Exception as exc:
             logger.error("User info failed: %s", exc)
@@ -705,15 +703,24 @@ class GetCategoriesInput(BaseModel):
 
 class GetCategoriesTool(BaseTool):
     name: str = "get_itil_categories"
-    description: str = "Ambil daftar kategori ITIL."
+    description: str = "Ambil daftar kategori ITIL yang tersedia untuk pembuatan tiket."
     args_schema: Type[BaseModel] = GetCategoriesInput
 
     def _run(self, limit: int = 20) -> str:
         try:
             results = _run_async(it_glpi_client.fetch_itil_categories(limit=limit))
-            return str(results) if results else "Tidak ada kategori."
+            if not results:
+                return "Tidak ada kategori ITIL ditemukan."
+            output = f"Daftar kategori ITIL ({len(results)} item):\n\n"
+            for cat in results:
+                cid = cat.get("id") or cat.get("1") or "-"
+                name = cat.get("name") or cat.get("2") or "-"
+                completename = cat.get("completename") or cat.get("16") or ""
+                display = completename if completename and completename != name else name
+                output += f"• (ID: {cid}) {display}\n"
+            return output
         except Exception as exc:
-            return f"Gagal: {exc}"
+            return f"Gagal mengambil kategori ITIL: {exc}"
 
 
 class GetSuppliersInput(BaseModel):
@@ -721,39 +728,44 @@ class GetSuppliersInput(BaseModel):
 
 class GetSuppliersTool(BaseTool):
     name: str = "get_suppliers"
-    description: str = "Ambil daftar supplier/vendor."
+    description: str = "Ambil daftar supplier/vendor yang terdaftar di GLPI."
     args_schema: Type[BaseModel] = GetSuppliersInput
 
     def _run(self, limit: int = 20) -> str:
         try:
             results = _run_async(it_glpi_client.fetch_suppliers(limit=limit))
             if not results:
-                return "Tidak ada supplier ditemukan."
+                return "Tidak ada supplier/vendor ditemukan di GLPI."
 
-            output = "Daftar supplier/vendor:\n\n"
+            output = f"Daftar supplier/vendor ({len(results)} item):\n\n"
             for s in results:
-                output += f"• {s.get('name', '-')} (ID: {s.get('id', '-')})\n"
+                sid = s.get("id") or "-"
+                name = s.get("name") or "-"
+                output += f"• {name} (ID: {sid})\n"
             return output
         except Exception as exc:
-            return f"Gagal: {exc}"
+            return f"Gagal mengambil supplier: {exc}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Instantiated tools — import these in it_support.py
 # ══════════════════════════════════════════════════════════════════════════════
 
-tool_search_kb           = SearchKnowledgeBaseTool()
-tool_get_assets          = GetUserAssetsTool()
-tool_get_all_computers   = GetAllComputersTool()
-tool_get_computer_detail = GetComputerDetailTool()
-tool_get_contracts       = GetContractsTool()
-tool_get_contract_detail = GetContractDetailTool()
-tool_get_multiple_items  = GetMultipleItemsTool()
-tool_list_search_options = ListSearchOptionsTool()
-tool_get_tickets         = GetTicketsTool()
-tool_get_user_info       = GetUserInfoTool()
-tool_get_categories      = GetCategoriesTool()
-tool_get_suppliers       = GetSuppliersTool()
+tool_search_kb                = SearchKnowledgeBaseTool()
+tool_get_assets               = GetUserAssetsTool()
+tool_get_all_computers        = GetAllComputersTool()
+tool_get_computer_detail      = GetComputerDetailTool()
+tool_get_contracts            = GetContractsTool()
+tool_get_contract_detail      = GetContractDetailTool()
+tool_get_multiple_items       = GetMultipleItemsTool()
+tool_list_search_options      = ListSearchOptionsTool()
+tool_get_tickets              = GetTicketsTool()
+tool_get_user_info            = GetUserInfoTool()
+tool_get_categories           = GetCategoriesTool()
+tool_get_suppliers            = GetSuppliersTool()
 tool_count_all_computers      = CountAllComputersTool()
 tool_search_computer_by_name  = SearchComputerByNameTool()
 tool_search_computer          = SearchComputerTool()
+tool_get_computers_by_status  = GetComputersByStatusTool()
+tool_get_computers_by_location = GetComputersByLocationTool()
+tool_get_computers_by_os      = GetComputersByOsTool()

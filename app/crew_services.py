@@ -2,52 +2,31 @@
 
 Creates and runs CrewAI crew with IT Support Agent to handle user queries.
 
-CHANGELOG (bug-fix):
-  - _format_history(): now correctly excludes only the *last* user message
-    (the current question) instead of any message with matching content —
-    fixing cases where the same question appears multiple times in history.
-  - Task description: user context (user_id, session info) is now embedded
-    in the history block header so it survives across tool calls.
-  - Added explicit "Informasi Konteks Sesi" block so agent always knows
-    the user_id even when restored from session (not in request body).
+FIXES v3.0:
+  - Task description: lebih ringkas, hindari ambiguitas yang membuat agent
+    bingung antara "pakai riwayat" vs "panggil tool".
+  - Tambah post-processing agresif: buang semua sisa Thought/Action yang
+    bocor ke output sebelum dikembalikan ke user.
+  - _format_history: tetap pakai pendekatan v2.1 (exclude last user by index).
+  - _postprocess_result: fungsi baru yang lebih robust untuk membersihkan
+    output agent.
+  - Hapus _TOOL_ROUTING dari sini (sudah dipindah ke backstory agent).
 """
 
 import logging
+import re
 from typing import Any
 
 from crewai import Crew, LLM, Task, Process
 
 from app.agents import build_it_support
 from app.config import settings
+from app.utils import sanitize_agent_output  # FIX #2: shared canonical sanitizer
 
 logger = logging.getLogger(__name__)
 
 # Maximum number of previous messages to include as context.
 _HISTORY_WINDOW = 10  # 5 turns = 10 messages (user + assistant)
-
-_TOOL_ROUTING = """
-PANDUAN PEMILIHAN TOOL (WAJIB IKUTI):
-┌─────────────────────────────────────────────────────────────────────┐
-│ Pertanyaan User               → Tool yang HARUS dipanggil           │
-├─────────────────────────────────────────────────────────────────────┤
-│ komputer/laptop/aset saya     → get_assets_by_user (user_id=X)      │
-│ semua komputer / inventaris   → list_all_computers                  │
-│ detail komputer ID X          → get_computer_detail (computer_id=X) │
-│ kontrak / contract / vendor   → list_all_contracts                  │
-│ kontrak aktif                 → list_all_contracts (active_only=True)│
-│ detail kontrak ID X           → get_contract_detail (contract_id=X) │
-│ tiket / request saya          → get_user_tickets (user_id=X)        │
-│ profil / info akun            → get_user_profile (user_id=X)        │
-│ supplier / vendor             → list_suppliers                      │
-│ kategori tiket / ITIL         → list_itil_categories                │
-│ cara / prosedur / panduan     → search_knowledge_base               │
-└─────────────────────────────────────────────────────────────────────┘
-
-LARANGAN MUTLAK:
-• DILARANG menjawab pertanyaan tentang data GLPI tanpa memanggil tool
-• DILARANG mengarang angka, nama, atau status yang tidak ada di output tool
-• DILARANG menampilkan JSON, 'Action:', 'Thought:', atau format internal
-"""
 
 
 def _create_llm() -> LLM:
@@ -63,13 +42,10 @@ def _create_llm() -> LLM:
 def _format_history(messages: list[dict[str, str]], current_message: str) -> str:
     """Format previous conversation turns into a readable context block.
 
-    BUG FIX (v2.1): Previously used content-equality to exclude the current
-    message, which silently dropped earlier occurrences of the same question.
-    Now we exclude only the *last* user message by index, which is always the
-    current question regardless of whether the same text appeared before.
+    Excludes only the *last* user message by index (the current question).
 
     Args:
-        messages       : Full merged messages array (already includes current turn).
+        messages       : Full merged messages array (includes current turn).
         current_message: The latest user message text (used only as a label).
 
     Returns:
@@ -85,10 +61,7 @@ def _format_history(messages: list[dict[str, str]], current_message: str) -> str
             last_user_idx = i
             break
 
-    # Prior messages = everything before the last user message
     prior = messages[:last_user_idx] if last_user_idx > 0 else []
-
-    # Keep only the last N messages to avoid oversized prompts
     windowed = prior[-_HISTORY_WINDOW:]
 
     if not windowed:
@@ -108,6 +81,10 @@ def _format_history(messages: list[dict[str, str]], current_message: str) -> str
     return "\n".join(lines)
 
 
+# _postprocess_result removed — FIX #2: now using app.utils.sanitize_agent_output
+# which is the single canonical implementation shared with main.py.
+
+
 def run_crew(
     user_message: str,
     glpi_user_id: int,
@@ -121,7 +98,7 @@ def run_crew(
         messages      : Full merged conversation history (includes current turn).
 
     Returns:
-        Final answer string from the agent.
+        Final answer string from the agent (already post-processed).
 
     Note:
         This is a blocking call — use run_in_executor when calling from async context.
@@ -132,51 +109,69 @@ def run_crew(
     all_messages = messages or []
     history_text: str = _format_history(all_messages, user_message)
 
-    # Build a rich context block for the task.
-    # 1) Session context (always shown so agent knows who the user is)
+    # ── Blok 1: Konteks sesi (selalu ditampilkan) ─────────────────────────────
     user_context_block = (
-        f"[KONTEKS SESI]\n"
-        f"• GLPI User ID aktif : {glpi_user_id if glpi_user_id > 0 else '(belum diketahui)'}\n"
+        "[KONTEKS SESI]\n"
+        f"• GLPI User ID aktif : {glpi_user_id if glpi_user_id > 0 else '(belum diketahui — jangan gunakan user_id=0 untuk query personal)'}\n"
         f"• Jumlah pesan dalam riwayat: {len(all_messages)}\n\n"
     )
 
-    # 2) Conversation history (prior turns only, not the current question)
+    # ── Blok 2: Riwayat percakapan (hanya turn sebelumnya) ───────────────────
     history_block: str = (
         f"[RIWAYAT PERCAKAPAN SEBELUMNYA]\n{history_text}\n\n"
         if history_text
         else ""
     )
 
-    task: Task = Task(
-        description=f"""
-{user_context_block}{history_block}[PERTANYAAN TERBARU DARI USER]
+    # ── Blok 3: Panduan tool berdasarkan user_id ─────────────────────────────
+    uid_note = (
+        f"user_id={glpi_user_id}"
+        if glpi_user_id > 0
+        else "user_id=UNKNOWN (jangan panggil tool personal tanpa ID yang valid)"
+    )
+
+    task_description = f"""\
+{user_context_block}{history_block}\
+[PERTANYAAN TERBARU DARI USER]
 "{user_message}"
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ATURAN PENGGUNAAN TOOL:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PANDUAN PENGERJAAN:
 
-1. Jika pertanyaan merujuk JELAS pada data yang SUDAH ADA di riwayat percakapan
-   di atas (contoh: "sebutkan komputer tersebut", "komputer yang tadi", "tiket itu"),
-   JANGAN panggil tool lagi — gunakan langsung data dari riwayat percakapan.
+1. Periksa riwayat percakapan di atas. Jika data yang diperlukan SUDAH ADA
+   dan user hanya merujuk data itu (mis. "komputer tadi", "tiket itu"),
+   JANGAN panggil tool lagi — gunakan data dari riwayat.
 
-2. Jika butuh data BARU dari GLPI:
-   • Panduan/KB          → search_knowledge_base
-   • Semua komputer      → get_all_computers
-   • Aset milik user     → get_user_assets (user_id={glpi_user_id})
-   • Tiket user          → get_user_tickets (user_id={glpi_user_id})
-   • Profil user         → get_user_info (user_id={glpi_user_id})
-   • Kontrak             → list_all_contracts
-   • Supplier            → list_suppliers
-   • Kategori ITIL       → list_itil_categories
+2. Jika data BELUM ADA atau user meminta data baru, panggil tool yang sesuai:
+   • Panduan/KB             → search_knowledge_base
+   • Semua komputer         → get_all_computers
+   • Jumlah/total komputer  → count_all_computers
+   • Cari komputer (nama/serial/inv) → search_computer
+   • Komputer by lokasi     → get_computers_by_location
+   • Komputer by status     → get_computers_by_status
+   • Komputer by OS         → get_computers_by_os
+   • Aset milik user        → get_user_assets ({uid_note})
+   • Detail komputer by ID  → get_computer_detail
+   • Tiket user             → get_user_tickets ({uid_note})
+   • Profil user            → get_user_info ({uid_note})
+   • Kontrak                → list_all_contracts
+   • Detail kontrak by ID   → get_contract_detail
+   • Supplier               → get_suppliers
+   • Kategori ITIL          → get_itil_categories
 
-3. SELALU gunakan user_id={glpi_user_id} untuk semua tool yang membutuhkan user_id.
-   JANGAN gunakan user_id=0 jika user_id sudah diketahui.
+3. WAJIB: Semua tool yang butuh user_id → gunakan {uid_note}.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Jawab dalam bahasa Indonesia yang sopan dan natural.
-Jangan tampilkan format internal/JSON/Action/Thought.
-        """,
-        expected_output="Jawaban akhir dalam bahasa Indonesia.",
+4. Tulis Final Answer dalam Bahasa Indonesia yang sopan dan natural.
+   JANGAN tampilkan JSON, "Action:", "Thought:", atau format internal apapun.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\
+"""
+
+    task: Task = Task(
+        description=task_description,
+        expected_output=(
+            "Jawaban akhir dalam Bahasa Indonesia yang sopan, akurat berdasarkan "
+            "data dari tool, tanpa format internal seperti Thought/Action/JSON."
+        ),
         agent=agent,
     )
 
@@ -191,18 +186,24 @@ Jangan tampilkan format internal/JSON/Action/Thought.
     logger.info(
         "Crew kickoff | user_id=%s | prior_turns=%d | msg='%s...'",
         glpi_user_id,
-        max(0, prior_turns - 1),  # exclude current question
-        user_message[:50],
+        max(0, prior_turns - 1),
+        user_message[:80],
     )
 
     try:
         result: Any = crew.kickoff()
+        raw_str = str(result)
+
+        # FIX #2: use shared canonical sanitizer instead of local _postprocess_result
+        clean_str = sanitize_agent_output(raw_str)
+
         logger.info(
             "Crew done | user_id=%s | result='%s...'",
             glpi_user_id,
-            str(result)[:100],
+            clean_str[:120],
         )
-        return str(result)
+        return clean_str
+
     except Exception as exc:
-        logger.error("Crew execution failed: %s", exc)
-        return "Mohon maaf, sistem sedang mengalami kendala internal."
+        logger.error("Crew execution failed: %s", exc, exc_info=True)
+        return "Mohon maaf, sistem sedang mengalami kendala teknis. Silakan coba beberapa saat lagi."
