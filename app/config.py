@@ -21,28 +21,35 @@ class Settings(BaseSettings):
         glpi_user_token: GLPI user token for session init
     """
 
+    # Konfigurasi utama
     mock_mode: bool = False
-    # FIX #5: verbose CrewAI agent output is disabled in production by default.
-    # Set CREW_VERBOSE=true in .env to enable for local debugging.
     crew_verbose: bool = False
+    
+    #Provider Selection
+    llm_provider: str = "openai"
+    llm_model: str= "gpt-5-mini"
+
     # AI Gateway (Nemotron)
     ai_gateway_url: str
     ai_gateway_base_url: str = ""
     ai_gateway_api_key: str
 
     # Model for CrewAI
-    nemotron_model: str = "aj/ai"
+    ai_model: str = "gpt-5-mini"
 
     # FastAPI Gateway security
     gateway_api_key: str
     allowed_origins: str = "http://172.16.14.141"
 
     # GLPI API
-    glpi_url: str = "http://172.16.14.141"
+    glpi_url: str = "https://172.16.14.141"
     glpi_app_token: str = ""
     glpi_user_token: str = ""
-    glpi_api_url: str = "http://172.16.14.141/apirest.php"
+    glpi_api_url: str = "https://172.16.14.141/asset/apirest.php"
 
+    # SSL
+    glpi_verify_ssl: bool = False
+    
     # Session config
     session_ttl_minutes: int = 60
 

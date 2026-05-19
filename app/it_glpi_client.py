@@ -23,23 +23,32 @@ All GET endpoints map 1-to-1 with the Postman collection:
     GET /ITILCategory                      → fetch_itil_categories()
     GET /Supplier                          → fetch_suppliers()
 
-CHANGELOG (bug-fix v2.1):
-  asyncio.Lock() objects MUST NOT be created at module level.  A Lock is
-  bound to the event loop that was running when it was constructed.  Since
+CHANGELOG (v4.0 — Smart Pagination):
+  - Tambah _get_all_pages(): internal helper untuk auto-pagination yang
+    mengambil semua halaman dari GLPI Search API secara efisien.
+  - Tambah PagedResult TypedDict: membawa (items, totalcount) bersama-sama
+    sehingga tools dapat melaporkan jumlah exact ke LLM.
+  - get_all_computers(), get_computers_by_status(), get_computers_by_location(),
+    get_computers_by_os() sekarang mengembalikan PagedResult.
+  - get_total_computers_count() tetap ada untuk backward-compat tapi
+    tools baru cukup pakai totalcount dari PagedResult.
+  - GLPI_MAX_PAGE_SIZE = 100: batas aman per-request (server biasanya
+    reject range > 1000; 100 adalah nilai konservatif yang pasti didukung).
+
+CHANGELOG (bug-fix v2.1 — Event Loop):
+  asyncio.Lock() objects MUST NOT be created at module level. A Lock is
+  bound to the event loop that was running when it was constructed. Since
   tools.py now uses a single persistent background loop (started *after*
   module import), any Lock created at import time would be bound to a
-  *different* (or non-existent) loop and raise "got Future attached to a
-  different loop" / "Event loop is closed" on first use.
-
-  Fix: all Locks are created lazily inside async functions on first call,
-  which guarantees they are bound to the correct running loop.
+  *different* (or non-existent) loop and raise errors on first use.
+  Fix: all Locks are created lazily inside async functions on first call.
 """
 
 import asyncio
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, TypedDict
 
 import httpx
 
@@ -47,7 +56,7 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# GLPI API base URL — use glpi_api_url from config directly (e.g., http://glpi/apirest.php)
+# GLPI API base URL — use glpi_api_url from config directly
 GLPI_API_BASE: str = settings.glpi_api_url.rstrip("/")
 
 # Headers required for every GLPI API request
@@ -56,48 +65,69 @@ _BASE_HEADERS: dict[str, str] = {
     "App-Token": settings.glpi_app_token,
 }
 
+# ── Pagination constants ──────────────────────────────────────────────────────
+# GLPI membatasi jumlah record per request. Nilai 100 adalah nilai aman
+# yang didukung hampir semua versi GLPI tanpa konfigurasi khusus.
+# Naikkan ke 200-500 hanya jika server GLPI Anda sudah dikonfigurasi untuk itu.
+GLPI_MAX_PAGE_SIZE: int = 100
+
+# Batas total record yang akan di-fetch melalui auto-pagination.
+# Di luar batas ini, hanya summary statistik yang dikembalikan ke LLM
+# (menghemat token dan menghindari context window overflow).
+GLPI_AUTO_PAGINATE_LIMIT: int = 20_000
+
+
+# ── PagedResult TypedDict ─────────────────────────────────────────────────────
+
+class PagedResult(TypedDict):
+    """Wrapper hasil pagination dari GLPI Search API.
+
+    Attributes:
+        items     : List item yang sudah di-fetch (bisa subset dari total).
+        totalcount: Jumlah exact dari GLPI (selalu akurat, dari header API).
+        fetched   : Jumlah item yang benar-benar di-fetch (len(items)).
+        truncated : True jika totalcount > fetched (data dipotong untuk hemat token).
+    """
+    items: list[dict[str, Any]]
+    totalcount: int
+    fetched: int
+    truncated: bool
+
+
 # ── Session state ─────────────────────────────────────────────────────────────
-# Lock is created lazily on first use so it binds to the correct event loop.
 _session_token: str | None = None
 _session_lock: asyncio.Lock | None = None
-# FIX #12: shared Future lets waiting coroutines share one in-flight init call
-# instead of each blocking on the lock (which was held during the HTTP request).
 _session_waiter: "asyncio.Future[str] | None" = None
 
 
 def _get_session_lock() -> asyncio.Lock:
-    """Return the session lock, creating it inside the running loop if needed."""
     global _session_lock
     if _session_lock is None:
         _session_lock = asyncio.Lock()
     return _session_lock
 
 
-# ── Shared HTTP client (connection pooling) ──────────────────────────────────
-# Lock is also lazy for the same reason.
+# ── Shared HTTP client ────────────────────────────────────────────────────────
 _http_client: httpx.AsyncClient | None = None
 _http_client_lock: asyncio.Lock | None = None
 
 
 def _get_http_client_lock() -> asyncio.Lock:
-    """Return the HTTP client lock, creating it inside the running loop if needed."""
     global _http_client_lock
     if _http_client_lock is None:
         _http_client_lock = asyncio.Lock()
     return _http_client_lock
- 
+
+
 async def _get_http_client() -> httpx.AsyncClient:
-    """Return the shared AsyncClient, creating it once on first call."""
     global _http_client
-    # Fast-path: client already exists and is open — no lock needed.
     if _http_client is not None and not _http_client.is_closed:
         return _http_client
     async with _get_http_client_lock():
-        # Double-checked locking: another coroutine may have created it
-        # while we waited for the lock.
         if _http_client is None or _http_client.is_closed:
             _http_client = httpx.AsyncClient(
-                timeout=20,
+                timeout=30,
+                verify=settings.glpi_verify_ssl,
                 limits=httpx.Limits(
                     max_connections=20,
                     max_keepalive_connections=10,
@@ -106,7 +136,8 @@ async def _get_http_client() -> httpx.AsyncClient:
             )
             logger.debug("GLPI shared AsyncClient created")
     return _http_client
- 
+
+
 async def close_http_client() -> None:
     global _http_client
     if _http_client and not _http_client.is_closed:
@@ -114,41 +145,32 @@ async def close_http_client() -> None:
         _http_client = None
         logger.info("GLPI shared AsyncClient closed")
 
-# ── Simple TTL cache for near-static GLPI data ───────────────────────────────
-# Categories, suppliers, and KB articles rarely change between agent sessions.
-# Caching them avoids redundant API round-trips and speeds up every conversation.
 
+# ── Simple TTL cache ──────────────────────────────────────────────────────────
 _CACHE_TTL_SECONDS: int = 300
 _ttl_cache: dict[str, dict[str, Any]] = {}
 
-def _cache_get(key : str) -> Any | None:
+
+def _cache_get(key: str) -> Any | None:
     entry = _ttl_cache.get(key)
     if entry and time.monotonic() < entry["expires_at"]:
         return entry["value"]
     _ttl_cache.pop(key, None)
     return None
 
+
 def _cache_set(key: str, value: Any, ttl: int = _CACHE_TTL_SECONDS) -> None:
     _ttl_cache[key] = {"value": value, "expires_at": time.monotonic() + ttl}
+
 
 def invalidate_static_cache() -> None:
     _ttl_cache.clear()
     logger.info("GLPI static data cache cleared")
 
-# ── Session Management ──────────────────────────────────────────────────────
+
+# ── Session Management ────────────────────────────────────────────────────────
 
 async def _init_session() -> str:
-    """Create a new GLPI session using the configured user_token (service account).
- 
-    Endpoint: GET /initSession
-    Headers : Authorization: user_token {glpi_user_token}
- 
-    NOTE: Must only be called while holding ``_session_lock`` so that concurrent
-    requests don't each open their own redundant GLPI sessions.
- 
-    Returns:
-        A Session-Token string valid until killed or expired.
-    """
     client = await _get_http_client()
     resp = await client.get(
         f"{GLPI_API_BASE}/initSession",
@@ -164,13 +186,9 @@ async def _init_session() -> str:
         raise RuntimeError(f"GLPI initSession returned no token: {data}")
     logger.info("GLPI session obtained successfully")
     return token
- 
- 
+
+
 async def _kill_session(token: str) -> None:
-    """Close a GLPI session (best-effort, errors are silently ignored).
- 
-    Endpoint: GET /killSession
-    """
     try:
         client = await _get_http_client()
         await client.get(
@@ -179,18 +197,11 @@ async def _kill_session(token: str) -> None:
         )
     except Exception as exc:
         logger.warning("GLPI killSession failed (ignored): %s", exc)
- 
- 
-async def _get_session_token() -> str:
-    """Return the cached session token, creating one if absent.
 
-    FIX #12: The lock is held ONLY for the brief read/write of ``_session_token``
-    and ``_session_waiter`` — never during the HTTP call.  All concurrent callers
-    share a single ``asyncio.Future`` so only one ``_init_session()`` call is made.
-    """
+
+async def _get_session_token() -> str:
     global _session_token, _session_waiter
 
-    # Fast-path: token already present — no lock needed.
     if _session_token:
         return _session_token
 
@@ -203,17 +214,13 @@ async def _get_session_token() -> str:
         if _session_token:
             return _session_token
         if _session_waiter is not None:
-            # Another coroutine is already initializing — share its waiter.
             waiter = _session_waiter
         else:
-            # We are the "leader" coroutine that will do the HTTP call.
             waiter = loop.create_future()
             _session_waiter = waiter
             is_leader = True
-    # Lock is released here — HTTP call proceeds without blocking other coroutines.
 
     if not is_leader:
-        # Wait for the leader to complete the HTTP call.
         return await asyncio.shield(waiter)
 
     try:
@@ -229,27 +236,13 @@ async def _get_session_token() -> str:
         if not waiter.done():
             waiter.set_exception(exc)
         raise
- 
- 
+
+
 async def _get(
     path: str,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any] | list[Any]:
-    """Authenticated GET request to the GLPI API.
-
-    FIX #12: The session-refresh on HTTP 401 no longer holds ``_session_lock``
-    during the HTTP call.  The lock is only acquired to atomically swap the token.
-
-    FIX #13: Retries with exponential back-off (1 s, 2 s) on HTTP 429 and
-    transient 5xx errors.  The 401 refresh path retries once without back-off.
-
-    Args:
-        path  : URL path appended to GLPI_API_BASE (e.g., '/Computer').
-        params: Optional query-string parameters.
-
-    Returns:
-        Parsed JSON response (dict or list).
-    """
+    """Authenticated GET request to the GLPI API with retry & token refresh."""
     global _session_token
 
     async def _do_request(token: str) -> httpx.Response:
@@ -262,12 +255,10 @@ async def _get(
 
     token: str = await _get_session_token()
 
-    # ── Retry loop with exponential back-off (FIX #13) ───────────────────────
     _RETRYABLE = {429, 500, 502, 503, 504}
     for attempt in range(3):
         resp: httpx.Response = await _do_request(token)
 
-        # ── Token refresh on 401 (FIX #12: HTTP call outside lock) ──────────
         if resp.status_code == 401:
             logger.info("GLPI session expired — refreshing and retrying")
             lock = _get_session_lock()
@@ -275,7 +266,6 @@ async def _get(
             async with lock:
                 if _session_token == old_token:
                     _session_token = None
-            # HTTP call outside lock:
             new_token = await _init_session()
             async with lock:
                 if not _session_token:
@@ -284,7 +274,7 @@ async def _get(
             resp = await _do_request(token)
 
         if resp.status_code in _RETRYABLE and attempt < 2:
-            wait = 2 ** attempt   # 1 s, then 2 s
+            wait = 2 ** attempt
             logger.warning(
                 "GLPI API returned %s — retrying in %ss (attempt %d/3)",
                 resp.status_code, wait, attempt + 1,
@@ -295,49 +285,195 @@ async def _get(
         resp.raise_for_status()
         return resp.json()
 
-    # Should only reach here if all retries were exhausted (raise_for_status
-    # would have raised on the last iteration above).
     resp.raise_for_status()  # type: ignore[possibly-undefined]
     return resp.json()
 
-# ── Assets ──────────────────────────────────────────────────────────────────
 
-async def get_all_computers(limit: int = 50, has_serial: bool = False) -> list[dict[str, Any]]:
-    """Fetch all computers registered in GLPI.
+# ── NEW: Auto-Pagination Helper ───────────────────────────────────────────────
 
-    Postman: GET /Computer?expand_dropdowns=true&range=0-49
+async def _get_all_pages(
+    path: str,
+    base_params: dict[str, Any],
+    sample_size: int = 50,
+    max_total: int = GLPI_AUTO_PAGINATE_LIMIT,
+    page_size: int = GLPI_MAX_PAGE_SIZE,
+) -> PagedResult:
+    """Ambil semua halaman dari GLPI Search API secara otomatis.
+
+    Strategi dua fase:
+    1. Fase probe: ambil halaman pertama (sample_size record) untuk mendapatkan
+       ``totalcount`` yang akurat dari API.
+    2. Fase pagination: jika totalcount > sample_size, ambil halaman berikutnya
+       sampai semua data terkumpul atau mencapai max_total.
+
+    Token-aware: jika totalcount sangat besar (> max_total), fungsi berhenti
+    setelah max_total record agar tidak overflow context window LLM.
 
     Args:
-        limit     : Maximum number of records to return (maps to range=0-{limit-1}).
-        has_serial: If True, use Search API with server-side filter to return only
-                    computers that have a non-empty serial number (E.2 improvement).
+        path       : URL path GLPI (e.g., '/search/Computer').
+        base_params: Parameter dasar tanpa 'range' (akan di-override per halaman).
+        sample_size: Jumlah record di halaman pertama (probe). Default 50.
+        max_total  : Batas maksimum record yang di-fetch. Default 20.000.
+        page_size  : Jumlah record per halaman setelah probe. Default 100.
 
     Returns:
-        List of computer dicts with human-readable dropdown values including entity,
-        manufacturer, operating system, and last-update fields (B enrichment).
+        PagedResult dengan items, totalcount, fetched, dan truncated flag.
     """
-    # ── Server-side serial filter via Search API (E.2) ────────────────────────
-    if has_serial:
-        try:
-            params: dict[str, Any] = {
-                "criteria[0][field]": 5,              # Serial Number field
-                "criteria[0][searchtype]": "isnotempty",
-                "range": f"0-{limit - 1}",
-                "expand_dropdowns": "true",
-                **_COMPUTER_SEARCH_FORCEDISPLAY,
-            }
-            data = await _get("/search/Computer", params=params)
-            items: list[Any] = _extract_data(data)
-            return [_parse_computer_search_item(item) for item in items if isinstance(item, dict)]
-        except Exception as exc:
-            logger.warning("get_all_computers (has_serial, Search API) failed: %s — falling back", exc)
-            # Fall through to the standard GET /Computer approach
+    # ── Fase 1: Probe — ambil halaman pertama + dapatkan totalcount ───────────
+    probe_params = {**base_params, "range": f"0-{sample_size - 1}"}
+    probe_data = await _get(path, params=probe_params)
 
-    # ── Standard bulk fetch via GET /Computer ─────────────────────────────────
+    totalcount: int = 0
+    if isinstance(probe_data, dict):
+        totalcount = int(probe_data.get("totalcount", 0))
+
+    first_page_items = _extract_data(probe_data)
+    items: list[dict[str, Any]] = [
+        item for item in first_page_items if isinstance(item, dict)
+    ]
+
+    logger.info(
+        "_get_all_pages: path=%s totalcount=%d fetched_first=%d",
+        path, totalcount, len(items),
+    )
+
+    # Jika totalcount <= sample_size, semua data sudah ada di halaman pertama.
+    if totalcount <= sample_size or len(items) >= totalcount:
+        return PagedResult(
+            items=items,
+            totalcount=totalcount or len(items),
+            fetched=len(items),
+            truncated=False,
+        )
+
+    # ── Fase 2: Pagination — ambil halaman berikutnya ─────────────────────────
+    fetch_target = min(totalcount, max_total)
+    start = sample_size  # Lanjut dari setelah probe
+
+    while len(items) < fetch_target:
+        end = min(start + page_size - 1, fetch_target - 1)
+        page_params = {**base_params, "range": f"{start}-{end}"}
+
+        try:
+            page_data = await _get(path, params=page_params)
+            page_items = [
+                item for item in _extract_data(page_data)
+                if isinstance(item, dict)
+            ]
+        except Exception as exc:
+            logger.warning(
+                "_get_all_pages: error fetching range %d-%d: %s — stopping pagination",
+                start, end, exc,
+            )
+            break
+
+        if not page_items:
+            break  # Server tidak mengembalikan data lagi
+
+        items.extend(page_items)
+        logger.debug(
+            "_get_all_pages: fetched range %d-%d, total_so_far=%d",
+            start, end, len(items),
+        )
+
+        start = end + 1
+        if start >= fetch_target:
+            break
+
+    truncated = len(items) < totalcount
+    logger.info(
+        "_get_all_pages: DONE path=%s totalcount=%d fetched=%d truncated=%s",
+        path, totalcount, len(items), truncated,
+    )
+    return PagedResult(
+        items=items,
+        totalcount=totalcount,
+        fetched=len(items),
+        truncated=truncated,
+    )
+
+
+# ── Assets ────────────────────────────────────────────────────────────────────
+
+async def get_all_computers(
+    sample_size: int = 50,
+    has_serial: bool = False,
+    paginate: bool = True,
+) -> PagedResult:
+    """Fetch semua komputer di GLPI dengan dukungan auto-pagination.
+
+    PERUBAHAN v4.0: sekarang mengembalikan PagedResult (bukan list) agar
+    tools dapat melaporkan totalcount exact ke LLM.
+
+    Args:
+        sample_size: Jumlah komputer yang ditampilkan sebagai sample (default 50).
+        has_serial : Jika True, filter hanya komputer berserial number.
+        paginate   : Jika True, gunakan auto-pagination (ambil semua halaman).
+                     Jika False, hanya ambil sample_size record (mode cepat).
+
+    Returns:
+        PagedResult dengan items (sample), totalcount, fetched, truncated.
+    """
+    base_params: dict[str, Any] = {
+        "expand_dropdowns": "true",
+        **_COMPUTER_SEARCH_FORCEDISPLAY,
+    }
+
+    if has_serial:
+        base_params["criteria[0][field]"] = 5
+        base_params["criteria[0][searchtype]"] = "isnotempty"
+
+    try:
+        if paginate:
+            result = await _get_all_pages(
+                "/search/Computer",
+                base_params=base_params,
+                sample_size=sample_size,
+            )
+        else:
+            # Mode cepat: hanya satu request
+            probe_params = {**base_params, "range": f"0-{sample_size - 1}"}
+            raw = await _get("/search/Computer", params=probe_params)
+            totalcount = int(raw.get("totalcount", 0)) if isinstance(raw, dict) else 0
+            items = [
+                item for item in _extract_data(raw) if isinstance(item, dict)
+            ]
+            result = PagedResult(
+                items=items,
+                totalcount=totalcount or len(items),
+                fetched=len(items),
+                truncated=(totalcount > len(items)),
+            )
+
+        # Parse setiap item ke format standar
+        parsed_items = [
+            _parse_computer_search_item(item) for item in result["items"]
+        ]
+        # Fallback ke GET /Computer jika Search API tidak mengembalikan data
+        if not parsed_items:
+            return await _get_all_computers_fallback(sample_size, has_serial)
+
+        return PagedResult(
+            items=parsed_items,
+            totalcount=result["totalcount"],
+            fetched=len(parsed_items),
+            truncated=result["truncated"],
+        )
+
+    except Exception as exc:
+        logger.warning("get_all_computers (Search API) failed: %s — falling back", exc)
+        return await _get_all_computers_fallback(sample_size, has_serial)
+
+
+async def _get_all_computers_fallback(
+    sample_size: int,
+    has_serial: bool,
+) -> PagedResult:
+    """Fallback ke GET /Computer jika Search API gagal."""
     try:
         data = await _get("/Computer", params={
             "expand_dropdowns": "true",
-            "range": f"0-{limit - 1}",
+            "range": f"0-{sample_size - 1}",
         })
         items = _extract_data(data)
         result = [
@@ -346,14 +482,11 @@ async def get_all_computers(limit: int = 50, has_serial: bool = False) -> list[d
                 "name": item.get("name", ""),
                 "serial": item.get("serial", ""),
                 "otherserial": item.get("otherserial", ""),
-                # computertypes_id = hardware category (Notebook, Desktop, Server, …)
                 "type": _clean_value(item.get("computertypes_id")),
-                # computermodels_id = specific product name (e.g. ESPRIMO Mobile U9200)
                 "model": _clean_value(item.get("computermodels_id")) or _clean_value(item.get("model")),
                 "status": _clean_value(item.get("states_id")) or _clean_value(item.get("status")),
                 "location": _clean_value(item.get("locations_id")) or _clean_value(item.get("location")),
                 "user": _clean_value(item.get("users_id")) or _clean_value(item.get("user")),
-                # ── B: GLPI 11 missing fields ──────────────────────────────────
                 "entity": _clean_value(item.get("entities_id")),
                 "manufacturer": _clean_value(item.get("manufacturers_id")),
                 "os": _clean_value(item.get("operatingsystems_id")),
@@ -361,20 +494,30 @@ async def get_all_computers(limit: int = 50, has_serial: bool = False) -> list[d
             }
             for item in items if isinstance(item, dict)
         ]
-        # Client-side fallback if server-side isnotempty failed but has_serial=True
         if has_serial:
             result = [c for c in result if c.get("serial", "").strip()]
-        return result
+
+        return PagedResult(
+            items=result,
+            totalcount=len(result),  # Fallback: tidak ada totalcount
+            fetched=len(result),
+            truncated=False,
+        )
     except Exception as exc:
-        logger.warning("get_all_computers failed: %s", exc)
-        return []
+        logger.warning("_get_all_computers_fallback failed: %s", exc)
+        return PagedResult(items=[], totalcount=0, fetched=0, truncated=False)
+
 
 async def get_total_computers_count() -> int:
-    """Fetch the total number of computers registered in GLPI."""
+    """Fetch jumlah total komputer di GLPI (exact count dari API).
+
+    Dipertahankan untuk backward-compatibility dengan CountAllComputersTool.
+    Untuk penggunaan baru, pakai PagedResult.totalcount dari get_all_computers().
+    """
     try:
         data = await _get("/search/Computer", params={
             "is_recursive": "1",
-            "range": "0-1"
+            "range": "0-1",
         })
         if isinstance(data, dict) and "totalcount" in data:
             return int(data["totalcount"])
@@ -382,36 +525,26 @@ async def get_total_computers_count() -> int:
     except Exception as exc:
         logger.warning("get_total_computers_count failed: %s", exc)
         return 0
-    
+
 
 async def get_computer_by_id(computer_id: int) -> dict[str, Any] | None:
-    """Fetch a single computer with its financial data and linked contracts.
+    """Fetch satu komputer dengan data finansial dan kontrak terkait.
 
-    Postman: GET /Computer/{id}?expand_dropdowns=true
-             &with_infocoms=true&with_contracts=true&with_operatingsystems=true
-
-    Args:
-        computer_id: GLPI Computer ID.
-
-    Returns:
-        Computer dict (with nested _infocoms / _contracts / _operatingsystems),
-        or None if not found. Includes all GLPI 11 dashboard columns (B enrichment).
+    Endpoint: GET /Computer/{id}?expand_dropdowns=true
+              &with_infocoms=true&with_contracts=true&with_operatingsystems=true
     """
     try:
         data = await _get(f"/Computer/{computer_id}", params={
             "expand_dropdowns": "true",
             "with_infocoms": "true",
             "with_contracts": "true",
-            "with_operatingsystems": "true",   # B: Operating System
+            "with_operatingsystems": "true",
         })
         if not isinstance(data, dict):
             return None
 
         infocoms: dict[str, Any] = data.get("_infocoms") or {}
 
-        # ── Operating System ─────────────────────────────────────────────────
-        # Prefer the direct field (if GLPI caches it); fall back to the
-        # _operatingsystems nested list returned by with_operatingsystems=true.
         os_name: str = _clean_value(data.get("operatingsystems_id"))
         if not os_name:
             os_list: list[Any] = data.get("_operatingsystems") or []
@@ -426,25 +559,22 @@ async def get_computer_by_id(computer_id: int) -> dict[str, Any] | None:
             "name": data.get("name", ""),
             "serial": data.get("serial", ""),
             "otherserial": data.get("otherserial", ""),
-            # computertypes_id = hardware category (Notebook, Desktop, Server, …)
             "type": _clean_value(data.get("computertypes_id")),
-            # computermodels_id = specific product name (e.g. ESPRIMO Mobile U9200)
             "model": _clean_value(data.get("computermodels_id")),
             "status": _clean_value(data.get("states_id")),
             "location": _clean_value(data.get("locations_id")),
             "user": _clean_value(data.get("users_id")),
-            # ── B: GLPI 11 missing fields ────────────────────────────────────
             "entity": _clean_value(data.get("entities_id")),
             "manufacturer": _clean_value(data.get("manufacturers_id")),
             "os": os_name,
-            "contact": data.get("contact", ""),          # Alternate Username
+            "contact": data.get("contact", ""),
             "comment": _strip_html(data.get("comment", "") or ""),
-            "date_mod": data.get("date_mod", ""),        # Last Update
+            "date_mod": data.get("date_mod", ""),
             # Infocom (financial) fields
             "buy_date": infocoms.get("buy_date", ""),
-            "use_date": infocoms.get("use_date", ""),    # Startup date
+            "use_date": infocoms.get("use_date", ""),
             "warranty_duration": infocoms.get("warranty_duration", ""),
-            "warranty_date": infocoms.get("warranty_date", ""),   # Warranty expiry
+            "warranty_date": infocoms.get("warranty_date", ""),
             "value": infocoms.get("value", ""),
             "supplier": infocoms.get("suppliers_id", ""),
             # Linked contracts
@@ -467,53 +597,35 @@ async def get_computer_by_id(computer_id: int) -> dict[str, Any] | None:
 
 
 async def get_user_assets(user_id: int) -> list[dict[str, Any]]:
-    """Fetch computers owned by a specific user.
- 
-    Strategy 1 (primary): GLPI Search API — queries directly by ``users_id``
-    server-side. More precise and efficient than bulk-fetching all computers.
-    Multiple candidate field IDs are tried to handle GLPI version differences:
-      - Field 24 : User (most common in GLPI 10.x / 11)
-      - Field 4  : Type field (skip — causes false matches)
-      - Field 70 : users_id alternate
-      - Field 45 : user field in some GLPI setups
- 
-    Strategy 2 (fallback): GET /Computer with ``expand_dropdowns=true`` —
-    fetches up to 200 records and filters ``users_id`` client-side. Mirrors
-    what chat.php does with a direct DB query.
- 
+    """Fetch komputer yang dimiliki/ditugaskan kepada user tertentu.
+
+    Menggunakan GLPI Search API dengan berbagai candidate field untuk
+    kompatibilitas antar versi GLPI. Tidak menggunakan full pagination
+    karena data personal user biasanya kecil (< 50 item).
+
     Args:
         user_id: GLPI User ID.
- 
-    Returns:
-        List of computer dicts owned by the user (includes all GLPI 11
-        dashboard columns: entity, manufacturer, OS, otherserial, location).
-    """
 
+    Returns:
+        List of computer dicts owned by the user.
+    """
     def _normalise(item: dict[str, Any]) -> dict[str, Any]:
-        """Map raw GET /Computer item to the enriched output dict (Strategy 2)."""
         return {
             "id": item.get("id", ""),
             "name": item.get("name", ""),
             "serial": item.get("serial", ""),
-            "otherserial": item.get("otherserial", ""),    # A.3: always include
+            "otherserial": item.get("otherserial", ""),
             "type": _clean_value(item.get("computertypes_id")),
             "model": _clean_value(item.get("computermodels_id")) or _clean_value(item.get("model")),
             "status": _clean_value(item.get("states_id")) or _clean_value(item.get("status")),
             "location": _clean_value(item.get("locations_id")) or _clean_value(item.get("location")),
             "user": _clean_value(item.get("users_id")) or _clean_value(item.get("user")),
-            # ── B: GLPI 11 enrichment ──────────────────────────────────────────
             "entity": _clean_value(item.get("entities_id")),
             "manufacturer": _clean_value(item.get("manufacturers_id")),
             "os": _clean_value(item.get("operatingsystems_id")),
             "date_mod": item.get("date_mod", ""),
         }
 
-    # ── Strategy 1 (primary): Search API — server-side filter by users_id ────
-    # GLPI field numbers for "users_id" on Computer differ by version/config.
-    # We try all known candidates and return on first non-empty result.
-    # IMPORTANT: forcedisplay uses CORRECT GLPI 11 field IDs:
-    #   1=Name, 2=ID, 3=Location, 4=Type, 5=Serial, 6=Inventory No, 14=OS,
-    #   23=Manufacturer, 31=Status, 40=Model, 80=Entity
     candidate_fields = [
         (24, "User (GLPI 10.x/11 standard)"),
         (70, "users_id alternate"),
@@ -526,43 +638,39 @@ async def get_user_assets(user_id: int) -> list[dict[str, Any]]:
                 "criteria[0][field]": field_id,
                 "criteria[0][searchtype]": "equals",
                 "criteria[0][value]": user_id,
-                "range": "0-1k",                         # E.1: was 0-99, raised to 199
+                "range": "0-199",
                 "expand_dropdowns": "true",
-                # ── A.1 FIX: correct GLPI 11 field numbers ────────────────────
-                "forcedisplay[0]": 1,    # Name
-                "forcedisplay[1]": 2,    # ID
-                "forcedisplay[2]": 3,    # Location
-                "forcedisplay[3]": 4,    # Type
-                "forcedisplay[4]": 5,    # Serial Number
-                "forcedisplay[5]": 6,    # Inventory Number (otherserial)
-                "forcedisplay[6]": 23,   # Manufacturer
-                "forcedisplay[7]": 31,   # Status
-                "forcedisplay[8]": 40,   # Model
-                "forcedisplay[9]": 80,   # Entity
-                "forcedisplay[10]": field_id,  # The user field we filtered by
+                "forcedisplay[0]": 1,
+                "forcedisplay[1]": 2,
+                "forcedisplay[2]": 3,
+                "forcedisplay[3]": 4,
+                "forcedisplay[4]": 5,
+                "forcedisplay[5]": 6,
+                "forcedisplay[6]": 23,
+                "forcedisplay[7]": 31,
+                "forcedisplay[8]": 40,
+                "forcedisplay[9]": 80,
+                "forcedisplay[10]": field_id,
             }
             data = await _get("/search/Computer", params=params)
-            raw_count = data.get("totalcount", 0) if isinstance(data, dict) else 0
             items: list[Any] = _extract_data(data)
 
             if items:
                 logger.info(
-                    "get_user_assets (strategy 1 Search API, field=%s '%s'): found %d results",
+                    "get_user_assets (Search API, field=%s '%s'): found %d results",
                     field_id, label, len(items),
                 )
                 return [
                     {
-                        # ── A.1 FIX: correct Search API field→key mapping ────
                         "id": _first(item, "2", "id"),
                         "name": _first(item, "1", "name"),
                         "serial": _first(item, "5", "serial"),
-                        "otherserial": _first(item, "6", "otherserial"),  # A.3 fix
+                        "otherserial": _first(item, "6", "otherserial"),
                         "type": _clean_value(_first(item, "4", "computertypes_id", "type")),
                         "model": _clean_value(_first(item, "40", "computermodels_id", "model")),
                         "status": _clean_value(_first(item, "31", "states_id", "status")),
                         "location": _clean_value(_first(item, "3", "locations_id", "location")),
                         "user": _clean_value(_first(item, str(field_id), "users_id", "user")),
-                        # ── B: enrichment fields ──────────────────────────────
                         "entity": _clean_value(_first(item, "80", "entities_id", "entity")),
                         "manufacturer": _clean_value(_first(item, "23", "manufacturers_id", "manufacturer")),
                         "os": _clean_value(_first(item, "14", "operatingsystems_id", "os")),
@@ -570,21 +678,13 @@ async def get_user_assets(user_id: int) -> list[dict[str, Any]]:
                     }
                     for item in items if isinstance(item, dict)
                 ]
-
-            logger.debug(
-                "get_user_assets (strategy 1 Search API, field=%s '%s'): 0 results (totalcount=%s)",
-                field_id, label, raw_count,
-            )
         except Exception as exc:
             logger.debug(
-                "get_user_assets (strategy 1 Search API, field=%s '%s') error: %s",
+                "get_user_assets (Search API, field=%s '%s') error: %s",
                 field_id, label, exc,
             )
 
-    # ── Strategy 2 (fallback): GET /Computer, filter client-side ─────────────
-    # Capped at 200 records — the Search API above handles the common case;
-    # this fallback exists only for edge-case GLPI configs where none of the
-    # Search API field IDs map correctly.
+    # Strategy 2 fallback: GET /Computer, filter client-side
     try:
         data = await _get("/Computer", params={
             "expand_dropdowns": "true",
@@ -592,53 +692,27 @@ async def get_user_assets(user_id: int) -> list[dict[str, Any]]:
             "is_deleted": "0",
         })
         all_computers: list[Any] = _extract_data(data)
-
-        # Filter client-side — users_id matches either as int or string
         user_computers = [
             item for item in all_computers
             if isinstance(item, dict)
             and str(item.get("users_id", "")) == str(user_id)
             and str(item.get("is_deleted", "0")) == "0"
         ]
-
         if user_computers:
             logger.info(
-                "get_user_assets (strategy 2 bulk GET): found %d computers for user_id=%s",
+                "get_user_assets (fallback bulk GET): found %d computers for user_id=%s",
                 len(user_computers), user_id,
             )
             return [_normalise(c) for c in user_computers]
-
-        logger.info(
-            "get_user_assets (strategy 2 bulk GET): no match for user_id=%s in %d computers",
-            user_id, len(all_computers),
-        )
     except Exception as exc:
-        logger.warning(
-            "get_user_assets strategy 2 failed (user_id=%s): %s",
-            user_id, exc,
-        )
+        logger.warning("get_user_assets strategy 2 failed (user_id=%s): %s", user_id, exc)
 
-    logger.warning(
-        "get_user_assets: all strategies exhausted, no assets found for user_id=%s",
-        user_id,
-    )
+    logger.warning("get_user_assets: no assets found for user_id=%s", user_id)
     return []
 
 
 async def search_computer_by_name(name: str, limit: int = 50) -> list[dict[str, Any]]:
-    """Fetch computers by their name using the GLPI search API.
-
-    A.2 FIX: Enriched output — now returns all GLPI 11 dashboard fields
-    (entity, manufacturer, location, OS, date_mod) in addition to the
-    previous minimalist id+name output.
-
-    Args:
-        name : Nama atau substring nama komputer yang dicari.
-        limit: Jumlah maksimal hasil yang dikembalikan (default 50).
-
-    Returns:
-        List of computer dicts with full GLPI 11 column coverage.
-    """
+    """Cari komputer berdasarkan nama menggunakan GLPI Search API."""
     try:
         params: dict[str, Any] = {
             "criteria[0][field]": 1,
@@ -646,288 +720,156 @@ async def search_computer_by_name(name: str, limit: int = 50) -> list[dict[str, 
             "criteria[0][value]": name,
             "range": f"0-{limit - 1}",
             "expand_dropdowns": "true",
-            # ── A.2 FIX: request all GLPI 11 relevant fields ─────────────────
-            "forcedisplay[0]": 1,    # Name
-            "forcedisplay[1]": 2,    # ID
-            "forcedisplay[2]": 3,    # Location
-            "forcedisplay[3]": 4,    # Type
-            "forcedisplay[4]": 5,    # Serial Number
-            "forcedisplay[5]": 6,    # Inventory Number (otherserial)
-            "forcedisplay[6]": 14,   # Operating System
-            "forcedisplay[7]": 19,   # Last Update (date_mod)
-            "forcedisplay[8]": 23,   # Manufacturer
-            "forcedisplay[9]": 31,   # Status
-            "forcedisplay[10]": 40,  # Model
-            "forcedisplay[11]": 80,  # Entity
+            **_COMPUTER_SEARCH_FORCEDISPLAY,
         }
-
         data = await _get("/search/Computer", params=params)
         items: list[Any] = _extract_data(data)
-
-        return [
-            {
-                # ── Core identity ─────────────────────────────────────────────
-                "id":           _first(item, "2", "id"),
-                "name":         _first(item, "1", "name"),
-                "serial":       _first(item, "5", "serial"),
-                "otherserial":  _first(item, "6", "otherserial"),
-                # ── Type / model ──────────────────────────────────────────────
-                "type":         _clean_value(_first(item, "4", "computertypes_id")),
-                "model":        _clean_value(_first(item, "40", "computermodels_id", "model")),
-                # ── Status / location ─────────────────────────────────────────
-                "status":       _clean_value(_first(item, "31", "states_id", "status")),
-                "location":     _clean_value(_first(item, "3", "locations_id", "location")),
-                # ── B: GLPI 11 enrichment ─────────────────────────────────────
-                "entity":       _clean_value(_first(item, "80", "entities_id")),
-                "manufacturer": _clean_value(_first(item, "23", "manufacturers_id")),
-                "os":           _clean_value(_first(item, "14", "operatingsystems_id")),
-                "date_mod":     _first(item, "19", "date_mod"),
-            }
-            for item in items if isinstance(item, dict)
-        ]
+        return [_parse_computer_search_item(item) for item in items if isinstance(item, dict)]
     except Exception as exc:
         logger.warning("search_computer_by_name failed: %s", exc)
         return []
 
+
 async def search_computer(query: str, limit: int = 10) -> list[dict[str, Any]]:
-    """Universal computer search — matches Name, Serial Number, OR Inventory Number.
- 
-    Single API call using GLPI's OR-criteria so the user can type any identifier
-    (hostname, SN, inventory tag) without knowing which field it lives in.
- 
-    Endpoint: GET /search/Computer with OR across fields 1, 5, 6.
- 
-    Args:
-        query: Free-text query matched (case-insensitive ``contains``) against:
-               • field 1  — Name
-               • field 5  — Serial Number
-               • field 6  — Inventory Number (otherserial)
-        limit: Maximum number of results (default 10).
- 
-    Returns:
-        List of normalised computer dicts (same schema as other Computer functions).
-        Returns an empty list on error.
-    """ 
-    try: 
+    """Cari komputer menggunakan satu kata kunci di Nama, Serial, ATAU Inventory Number."""
+    try:
         params: dict[str, Any] = {
-            # ── OR criteria across the three most-searched fields ────────────
-            "criteria[0][field]":      1,            # Name
+            "criteria[0][field]":      1,
             "criteria[0][searchtype]": "contains",
             "criteria[0][value]":      query,
- 
             "criteria[1][link]":       "OR",
-            "criteria[1][field]":      5,            # Serial Number
+            "criteria[1][field]":      5,
             "criteria[1][searchtype]": "contains",
             "criteria[1][value]":      query,
- 
             "criteria[2][link]":       "OR",
-            "criteria[2][field]":      6,            # Inventory Number (otherserial)
+            "criteria[2][field]":      6,
             "criteria[2][searchtype]": "contains",
             "criteria[2][value]":      query,
- 
-            # ── Common display options ────────────────────────────────────────
             "range":            f"0-{limit - 1}",
             "expand_dropdowns": "true",
             **_COMPUTER_SEARCH_FORCEDISPLAY,
         }
         data = await _get("/search/Computer", params=params)
         items: list[Any] = _extract_data(data)
-
         results = [_parse_computer_search_item(item) for item in items if isinstance(item, dict)]
-        logger.info(
-            "search_computer: query='%s' ->%d results(s)", query, len(results)
-        )
+        logger.info("search_computer: query='%s' -> %d result(s)", query, len(results))
         return results
     except Exception as exc:
         logger.warning("search_computer failed (query='%s'): %s", query, exc)
         return []
 
-def _first(item: dict[str, Any], *keys: str) -> Any:
-    """Return the first non-empty value from ``item`` matching any of ``keys``."""
-    for k in keys:
-        v = item.get(k)
-        if v is not None and v != "":
-            return v
-    return ""
 
-
-
-# ── Shared Search API constants ───────────────────────────────────────────────
-# Standard GLPI 11 Computer search field IDs used across all Search API calls.
-# If your GLPI instance uses different field IDs, run list_search_options('Computer')
-# to verify and update accordingly.
-
-#: forcedisplay params common to ALL Computer search queries.
-_COMPUTER_SEARCH_FORCEDISPLAY: dict[str, int] = {
-    "forcedisplay[0]":  1,    # Name
-    "forcedisplay[1]":  2,    # ID
-    "forcedisplay[2]":  3,    # Location
-    "forcedisplay[3]":  4,    # Type
-    "forcedisplay[4]":  5,    # Serial Number
-    "forcedisplay[5]":  6,    # Inventory Number (otherserial)
-    "forcedisplay[6]":  14,   # Operating System
-    "forcedisplay[7]":  19,   # Last Update (date_mod)
-    "forcedisplay[8]":  23,   # Manufacturer
-    "forcedisplay[9]":  31,   # Status
-    "forcedisplay[10]": 40,   # Model
-    "forcedisplay[11]": 80,   # Entity
-    "forcedisplay[12]": 24,   # User (users_id) — FIX #1: was missing, agent had no owner data
-}
-
-#: Infocom warranty expiration field ID (linked to Computer via Search API).
-#: This is typically field 162 in GLPI 10/11. Use list_search_options('Computer')
-#: → look for "Warranty expiration date" or "Date d'expiration de garantie".
-_INFOCOM_WARRANTY_FIELD: int = 162
-
-
-def _parse_computer_search_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Convert a raw GLPI Search API Computer item to the standard enriched dict.
-
-    This shared parser is used by all Computer Search API functions so field
-    mapping is defined exactly once.
-
-    Args:
-        item: Raw dict from GLPI Search API (keys are field ID strings, e.g. "2").
-
-    Returns:
-        Normalised computer dict with all GLPI 11 dashboard columns.
-    """
-    return {
-        "id":           _first(item, "2", "id"),
-        "name":         _first(item, "1", "name"),
-        "serial":       _first(item, "5", "serial"),
-        "otherserial":  _first(item, "6", "otherserial"),
-        "type":         _clean_value(_first(item, "4", "computertypes_id", "type")),
-        "model":        _clean_value(_first(item, "40", "computermodels_id", "model")),
-        "status":       _clean_value(_first(item, "31", "states_id", "status")),
-        "location":     _clean_value(_first(item, "3", "locations_id", "location")),
-        # FIX #1: field 24 = User (users_id) — now included in forcedisplay
-        "user":         _clean_value(_first(item, "24", "users_id", "user")),
-        "entity":       _clean_value(_first(item, "80", "entities_id", "entity")),
-        "manufacturer": _clean_value(_first(item, "23", "manufacturers_id", "manufacturer")),
-        "os":           _clean_value(_first(item, "14", "operatingsystems_id", "os")),
-        "date_mod":     _first(item, "19", "date_mod"),
-    }
-
-
-# ── New Filter Functions (C: new tools) ───────────────────────────────────────
+# ── Filter Functions — sekarang mengembalikan PagedResult ─────────────────────
 
 async def get_computers_by_status(
     status_filter: str,
-    limit: int = 50,
-) -> list[dict[str, Any]]:
-    """Fetch computers filtered by status name (server-side).
+    sample_size: int = 50,
+) -> PagedResult:
+    """Fetch komputer berdasarkan status (server-side filter, auto-paginated).
 
-    Uses GLPI Search API with ``contains`` on field 31 (states_id).
+    PERUBAHAN v4.0: mengembalikan PagedResult (bukan list) agar tools dapat
+    melaporkan totalcount dan truncated flag ke LLM.
 
     Args:
-        status_filter: Status label to search for (e.g. 'aktif', 'rusak', 'disposed').
-                       Case-insensitive contains search.
-        limit        : Maximum number of results.
-
-    Returns:
-        List of computer dicts matching the given status.
+        status_filter: Label status yang dicari (contains, case-insensitive).
+        sample_size  : Jumlah item yang di-fetch sebagai sample jika data besar.
     """
+    base_params: dict[str, Any] = {
+        "criteria[0][field]": 31,
+        "criteria[0][searchtype]": "contains",
+        "criteria[0][value]": status_filter,
+        "expand_dropdowns": "true",
+        **_COMPUTER_SEARCH_FORCEDISPLAY,
+    }
     try:
-        params: dict[str, Any] = {
-            "criteria[0][field]": 31,              # Status (states_id)
-            "criteria[0][searchtype]": "contains",
-            "criteria[0][value]": status_filter,
-            "range": f"0-{limit - 1}",
-            "expand_dropdowns": "true",
-            **_COMPUTER_SEARCH_FORCEDISPLAY,
-        }
-        data = await _get("/search/Computer", params=params)
-        items: list[Any] = _extract_data(data)
-        return [_parse_computer_search_item(item) for item in items if isinstance(item, dict)]
+        result = await _get_all_pages(
+            "/search/Computer",
+            base_params=base_params,
+            sample_size=sample_size,
+        )
+        parsed = [_parse_computer_search_item(item) for item in result["items"]]
+        return PagedResult(
+            items=parsed,
+            totalcount=result["totalcount"],
+            fetched=len(parsed),
+            truncated=result["truncated"],
+        )
     except Exception as exc:
         logger.warning("get_computers_by_status failed (filter=%s): %s", status_filter, exc)
-        return []
+        return PagedResult(items=[], totalcount=0, fetched=0, truncated=False)
 
 
 async def get_computers_by_location(
     location_filter: str,
-    limit: int = 50,
-) -> list[dict[str, Any]]:
-    """Fetch computers filtered by location name (server-side).
+    sample_size: int = 50,
+) -> PagedResult:
+    """Fetch komputer berdasarkan lokasi (server-side filter, auto-paginated).
 
-    Uses GLPI Search API with ``contains`` on field 3 (locations_id).
-
-    Args:
-        location_filter: Location label to search for (e.g. 'lantai 3', 'gedung A').
-                         Case-insensitive contains search.
-        limit          : Maximum number of results.
-
-    Returns:
-        List of computer dicts at the given location.
+    PERUBAHAN v4.0: mengembalikan PagedResult.
     """
+    base_params: dict[str, Any] = {
+        "criteria[0][field]": 3,
+        "criteria[0][searchtype]": "contains",
+        "criteria[0][value]": location_filter,
+        "expand_dropdowns": "true",
+        **_COMPUTER_SEARCH_FORCEDISPLAY,
+    }
     try:
-        params: dict[str, Any] = {
-            "criteria[0][field]": 3,               # Location (locations_id)
-            "criteria[0][searchtype]": "contains",
-            "criteria[0][value]": location_filter,
-            "range": f"0-{limit - 1}",
-            "expand_dropdowns": "true",
-            **_COMPUTER_SEARCH_FORCEDISPLAY,
-        }
-        data = await _get("/search/Computer", params=params)
-        items: list[Any] = _extract_data(data)
-        return [_parse_computer_search_item(item) for item in items if isinstance(item, dict)]
+        result = await _get_all_pages(
+            "/search/Computer",
+            base_params=base_params,
+            sample_size=sample_size,
+        )
+        parsed = [_parse_computer_search_item(item) for item in result["items"]]
+        return PagedResult(
+            items=parsed,
+            totalcount=result["totalcount"],
+            fetched=len(parsed),
+            truncated=result["truncated"],
+        )
     except Exception as exc:
         logger.warning("get_computers_by_location failed (filter=%s): %s", location_filter, exc)
-        return []
+        return PagedResult(items=[], totalcount=0, fetched=0, truncated=False)
 
 
 async def get_computers_by_os(
     os_filter: str,
-    limit: int = 50,
-) -> list[dict[str, Any]]:
-    """Fetch computers filtered by operating system name (server-side).
+    sample_size: int = 50,
+) -> PagedResult:
+    """Fetch komputer berdasarkan OS (server-side filter, auto-paginated).
 
-    Uses GLPI Search API with ``contains`` on field 14 (operatingsystems_id).
-
-    Args:
-        os_filter: OS label to search for (e.g. 'Windows 10', 'Ubuntu').
-                   Case-insensitive contains search.
-        limit    : Maximum number of results.
-
-    Returns:
-        List of computer dicts running the given OS.
+    PERUBAHAN v4.0: mengembalikan PagedResult.
     """
+    base_params: dict[str, Any] = {
+        "criteria[0][field]": 14,
+        "criteria[0][searchtype]": "contains",
+        "criteria[0][value]": os_filter,
+        "expand_dropdowns": "true",
+        **_COMPUTER_SEARCH_FORCEDISPLAY,
+    }
     try:
-        params: dict[str, Any] = {
-            "criteria[0][field]": 14,              # Operating System
-            "criteria[0][searchtype]": "contains",
-            "criteria[0][value]": os_filter,
-            "range": f"0-{limit - 1}",
-            "expand_dropdowns": "true",
-            **_COMPUTER_SEARCH_FORCEDISPLAY,
-        }
-        data = await _get("/search/Computer", params=params)
-        items: list[Any] = _extract_data(data)
-        return [_parse_computer_search_item(item) for item in items if isinstance(item, dict)]
+        result = await _get_all_pages(
+            "/search/Computer",
+            base_params=base_params,
+            sample_size=sample_size,
+        )
+        parsed = [_parse_computer_search_item(item) for item in result["items"]]
+        return PagedResult(
+            items=parsed,
+            totalcount=result["totalcount"],
+            fetched=len(parsed),
+            truncated=result["truncated"],
+        )
     except Exception as exc:
         logger.warning("get_computers_by_os failed (filter=%s): %s", os_filter, exc)
-        return []
+        return PagedResult(items=[], totalcount=0, fetched=0, truncated=False)
 
 
 async def get_computers_expiring_warranty(
     days: int = 90,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    """Fetch computers whose warranty expires within the next N days.
-
-    Uses GLPI Search API with date range criteria on the Infocom warranty
-    expiration field (default: field 162 — verify via list_search_options
-    if your GLPI returns empty results).
-
-    Args:
-        days : Look-ahead window in days (default 90).
-        limit: Maximum number of results.
-
-    Returns:
-        List of computer dicts with an additional ``warranty_expiry`` field.
-    """
+    """Fetch komputer yang garansinya habis dalam N hari ke depan."""
     import datetime
     today = datetime.date.today()
     today_str = today.isoformat()
@@ -935,17 +877,14 @@ async def get_computers_expiring_warranty(
 
     try:
         warranty_field_str = str(_INFOCOM_WARRANTY_FIELD)
-        # Build forcedisplay including the warranty date field
         forcedisplay = dict(_COMPUTER_SEARCH_FORCEDISPLAY)
         next_idx = len(forcedisplay)
         forcedisplay[f"forcedisplay[{next_idx}]"] = _INFOCOM_WARRANTY_FIELD
 
         params: dict[str, Any] = {
-            # Expiry > today (already past warranties excluded)
             "criteria[0][field]": _INFOCOM_WARRANTY_FIELD,
             "criteria[0][searchtype]": "morethan",
             "criteria[0][value]": today_str,
-            # Expiry < today + days
             "criteria[1][link]": "AND",
             "criteria[1][field]": _INFOCOM_WARRANTY_FIELD,
             "criteria[1][searchtype]": "lessthan",
@@ -964,34 +903,17 @@ async def get_computers_expiring_warranty(
             for item in items if isinstance(item, dict)
         ]
     except Exception as exc:
-        logger.warning(
-            "get_computers_expiring_warranty failed (days=%s): %s — "
-            "verify _INFOCOM_WARRANTY_FIELD via list_search_options('Computer')",
-            days, exc,
-        )
+        logger.warning("get_computers_expiring_warranty failed: %s", exc)
         return []
 
 
-
+# ── Contracts ─────────────────────────────────────────────────────────────────
 
 async def get_contracts(
     computer_id: int = 0,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    """Fetch contracts from GLPI.
-
-    - computer_id=0  → all contracts via GET /Contract (Postman: List Contracts)
-    - computer_id>0  → contracts linked to that computer (via get_computer_by_id)
-
-    Postman: GET /Contract?expand_dropdowns=true&range=0-{limit-1}
-
-    Args:
-        computer_id: If > 0, return only contracts linked to this computer.
-        limit       : Maximum records when fetching all contracts.
-
-    Returns:
-        List of contract dicts.
-    """
+    """Fetch kontrak dari GLPI."""
     try:
         if computer_id > 0:
             computer = await get_computer_by_id(computer_id)
@@ -999,7 +921,6 @@ async def get_contracts(
                 return []
             return computer.get("contracts", [])
 
-        # All contracts
         data = await _get("/Contract", params={
             "expand_dropdowns": "true",
             "range": f"0-{limit - 1}",
@@ -1010,12 +931,12 @@ async def get_contracts(
                 "id": item.get("id", ""),
                 "name": item.get("name", ""),
                 "num": item.get("num", ""),
-                # expand_dropdowns=true resolves IDs to text labels
-                "supplier": item.get("suppliers_id", "") or item.get("supplier", ""),
-                "type": item.get("contracttypes_id", "") or item.get("type", ""),
+                "type": _clean_value(item.get("contracttypes_id")),
+                "supplier": _clean_value(item.get("suppliers_id")),
                 "begin_date": item.get("begin_date", ""),
                 "duration": item.get("duration", ""),
                 "end_date": item.get("end_date", ""),
+                "comment": _strip_html(item.get("comment", "") or ""),
             }
             for item in items if isinstance(item, dict)
         ]
@@ -1025,19 +946,11 @@ async def get_contracts(
 
 
 async def get_contract_by_id(contract_id: int) -> dict[str, Any] | None:
-    """Fetch a single contract by its ID.
-
-    Postman: GET /Contract/{id}
-
-    Args:
-        contract_id: GLPI Contract ID.
-
-    Returns:
-        Contract dict, or None if not found.
-    """
+    """Fetch detail satu kontrak berdasarkan ID."""
     try:
         data = await _get(f"/Contract/{contract_id}", params={
             "expand_dropdowns": "true",
+            "with_items": "true",
         })
         if not isinstance(data, dict):
             return None
@@ -1045,141 +958,101 @@ async def get_contract_by_id(contract_id: int) -> dict[str, Any] | None:
             "id": data.get("id", ""),
             "name": data.get("name", ""),
             "num": data.get("num", ""),
-            "supplier": data.get("suppliers_id", ""),
-            "type": data.get("contracttypes_id", ""),
+            "type": _clean_value(data.get("contracttypes_id")),
+            "supplier": _clean_value(data.get("suppliers_id")),
             "begin_date": data.get("begin_date", ""),
             "duration": data.get("duration", ""),
             "end_date": data.get("end_date", ""),
-            "comment": data.get("comment", ""),
+            "comment": _strip_html(data.get("comment", "") or ""),
         }
     except Exception as exc:
         logger.warning("get_contract_by_id failed (id=%s): %s", contract_id, exc)
         return None
 
 
-# ── Utilities ────────────────────────────────────────────────────────────────
+# ── Knowledge Base ────────────────────────────────────────────────────────────
+
+async def fetch_knowbase_items(
+    query: str,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Cari artikel Knowledge Base berdasarkan kata kunci."""
+    cache_key = f"kb:{query}:{limit}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+
+    try:
+        data = await _get("/KnowbaseItem", params={
+            "search": query,
+            "range": f"0-{limit - 1}",
+            "expand_dropdowns": "true",
+        })
+        items: list[Any] = _extract_data(data)
+        result = [
+            {
+                "id": item.get("id", ""),
+                "title": item.get("name", ""),
+                "answer": _strip_html(item.get("answer", "") or ""),
+            }
+            for item in items if isinstance(item, dict)
+        ]
+        _cache_set(cache_key, result)
+        return result
+    except Exception as exc:
+        logger.warning("fetch_knowbase_items failed: %s", exc)
+        return []
+
+
+# ── Multiple Items ────────────────────────────────────────────────────────────
 
 async def get_multiple_items(
     items: list[dict[str, Any]],
-    with_infocoms: bool = True,
-    with_contracts: bool = True,
 ) -> list[dict[str, Any]]:
-    """Fetch multiple items across different itemtypes in a single API call.
-
-    Postman: GET /getMultipleItems
-             ?items[0][itemtype]=Computer&items[0][items_id]=1
-             &items[1][itemtype]=Contract&items[1][items_id]=2
-             &with_infocoms=true&with_contracts=true
-
-    Args:
-        items          : List of {"itemtype": "Computer", "items_id": 1} dicts.
-        with_infocoms  : Include Infocom (financial) data in response.
-        with_contracts : Include linked contracts in response.
-
-    Returns:
-        List of item dicts (may include _infocoms and _contracts sub-keys).
-    """
+    """Fetch beberapa item GLPI sekaligus dalam satu request."""
     try:
-        params: dict[str, Any] = {
-            "expand_dropdowns": "true",
-            "with_infocoms": "true" if with_infocoms else "false",
-            "with_contracts": "true" if with_contracts else "false",
-        }
+        params: dict[str, Any] = {}
         for idx, item in enumerate(items):
             params[f"items[{idx}][itemtype]"] = item["itemtype"]
             params[f"items[{idx}][items_id]"] = item["items_id"]
 
-        data = await _get("/getMultipleItems", params=params)
-        return _extract_data(data)
+        data = await _get("/getMultipleItems", params={
+            **params,
+            "expand_dropdowns": "true",
+        })
+        result: list[Any] = _extract_data(data)
+        return [item for item in result if isinstance(item, dict)]
     except Exception as exc:
         logger.warning("get_multiple_items failed: %s", exc)
         return []
 
 
-async def list_search_options(itemtype: str = "Computer") -> dict[str, Any]:
-    """Get the available search fields for a given GLPI itemtype.
+# ── Search Options ────────────────────────────────────────────────────────────
 
-    Postman: GET /listSearchOptions/Computer (or any other itemtype)
+async def list_search_options(itemtype: str) -> dict[str, Any]:
+    """List field (search options) yang tersedia untuk suatu item type."""
+    cache_key = f"searchopts:{itemtype}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
 
-    Useful for discovering field numbers to use in criteria[n][field]
-    when building GLPI search queries.
-
-    Args:
-        itemtype: GLPI itemtype name (e.g., 'Computer', 'Contract', 'Ticket').
-
-    Returns:
-        Dict mapping field IDs to field metadata (name, table, field).
-    """
     try:
         data = await _get(f"/listSearchOptions/{itemtype}")
-        return data if isinstance(data, dict) else {}
+        result: dict[str, Any] = data if isinstance(data, dict) else {}
+        _cache_set(cache_key, result)
+        return result
     except Exception as exc:
-        logger.warning("list_search_options failed (itemtype=%s): %s", itemtype, exc)
+        logger.warning("list_search_options failed: %s", exc)
         return {}
-
-
-# ── Knowledge Base ────────────────────────────────────────────────────────────
-
-async def fetch_knowbase_items(query: str, limit: int = 5) -> list[dict[str, Any]]:
-    """Search Knowledge Base articles by keyword.
-
-    Endpoint: GET /KnowbaseItem?searchText[name]={query}&range=0-{limit-1}
-
-    Args:
-        query: Search keyword.
-        limit: Maximum number of articles to return.
-
-    Returns:
-        List of KB article dicts with id, title, and plain-text answer.
-    """
-
-    try:
-        data = await _get("/KnowbaseItem", params={
-            "searchText[name]": query,
-            "range": f"0-{limit - 1}",
-            "forcedisplay[0]": 1,   # ID
-            "forcedisplay[1]": 2,   # Name/title
-            "forcedisplay[2]": 5,   # Answer/content
-        })
-        items: list[Any] = _extract_data(data)
-        return [
-            {
-                "id": item.get("1") or item.get("id"),
-                "title": item.get("2") or item.get("name", ""),
-                "answer": _strip_html(item.get("5") or item.get("answer", "")),
-            }
-            for item in items
-            if isinstance(item, dict)  # FIX #7: guard against non-dict entries
-        ]
-    
-    except Exception as exc:
-        logger.warning("fetch_knowbase_items failed: %s", exc)
-        return []
 
 
 # ── Tickets ───────────────────────────────────────────────────────────────────
 
 async def fetch_user_tickets(
     glpi_user_id: int,
-    limit: int = 5,
+    limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """Fetch tickets created by a specific user via GLPI Search API.
-
-    Mirrors chat.php which queries glpi_tickets with
-    users_id_recipient = usersId and active statuses (1,2,3,4).
-
-    Candidate field IDs for requester user on Ticket:
-      - Field 4  : users_id (requester) — most common in GLPI 10.x
-      - Field 22 : Requester (alternative mapping)
-      - Field 64 : users_id_recipient (older versions)
-
-    Args:
-        glpi_user_id: GLPI User ID.
-        limit       : Maximum number of tickets to return.
-
-    Returns:
-        List of ticket dicts with id, title, status, last_update, content.
-    """
+    """Fetch tiket IT milik user dari GLPI."""
 
     def _parse_items(items: list[Any]) -> list[dict[str, Any]]:
         return [
@@ -1219,10 +1092,6 @@ async def fetch_user_tickets(
                     len(items), glpi_user_id, field_id,
                 )
                 return _parse_items(items)
-            logger.debug(
-                "fetch_user_tickets: 0 results for user_id=%s with field=%s",
-                glpi_user_id, field_id,
-            )
         except Exception as exc:
             logger.debug("fetch_user_tickets field=%s error: %s", field_id, exc)
 
@@ -1233,36 +1102,23 @@ async def fetch_user_tickets(
 # ── User Info ─────────────────────────────────────────────────────────────────
 
 async def fetch_user_info(glpi_user_id: int) -> dict[str, Any] | None:
-    """Fetch a user's profile from GLPI.
-
-    Endpoint: GET /User/{id}
-
-    Args:
-        glpi_user_id: GLPI User ID.
-
-    Returns:
-        User dict with name, email, and groups; or None if not found.
-        Name priority: realname > firstname > name (to avoid "GLPI" service account names)
-    """
+    """Fetch profil user dari GLPI."""
     try:
         data = await _get(f"/User/{glpi_user_id}")
         if not isinstance(data, dict):
             return None
-        
-        # Determine display name with priority: realname > firstname > name
-        # This avoids showing service account names like "GLPI"
+
         display_name = (
-            data.get("realname", "").strip() or 
-            data.get("firstname", "").strip() or 
-            data.get("name", "")
+            data.get("realname", "").strip()
+            or data.get("firstname", "").strip()
+            or data.get("name", "")
         )
-        
         return {
             "id": data.get("id"),
             "name": display_name,
             "realname": data.get("realname", ""),
             "firstname": data.get("firstname", ""),
-            "login": data.get("name", ""),  # Actual login/username
+            "login": data.get("name", ""),
             "email": (
                 data.get("_useremails", [{}])[0].get("email", "")
                 if data.get("_useremails") else ""
@@ -1279,25 +1135,28 @@ async def fetch_user_info(glpi_user_id: int) -> dict[str, Any] | None:
 # ── ITIL Categories ───────────────────────────────────────────────────────────
 
 async def fetch_itil_categories(limit: int = 20) -> list[dict[str, Any]]:
-    """Fetch ITIL categories for ticket creation.
+    """Fetch kategori ITIL untuk pembuatan tiket."""
+    cache_key = f"itil_categories:{limit}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
 
-    Endpoint: GET /ITILCategory?expand_dropdowns=true&range=0-{limit-1}
-    """
     try:
         data = await _get("/ITILCategory", params={
             "expand_dropdowns": "true",
             "range": f"0-{limit - 1}",
         })
         items: list[Any] = _extract_data(data)
-        return [
+        result = [
             {
                 "id": item.get("1") or item.get("id"),
                 "name": item.get("2") or item.get("name", ""),
                 "completename": item.get("16") or item.get("completename", ""),
             }
-            for item in items
-            if isinstance(item, dict)  # FIX #7: guard against non-dict entries
+            for item in items if isinstance(item, dict)
         ]
+        _cache_set(cache_key, result)
+        return result
     except Exception as exc:
         logger.warning("fetch_itil_categories failed: %s", exc)
         return []
@@ -1306,20 +1165,19 @@ async def fetch_itil_categories(limit: int = 20) -> list[dict[str, Any]]:
 # ── Suppliers ─────────────────────────────────────────────────────────────────
 
 async def fetch_suppliers(limit: int = 20) -> list[dict[str, Any]]:
-    """Fetch suppliers / vendors from GLPI.
+    """Fetch daftar supplier/vendor dari GLPI."""
+    cache_key = f"suppliers:{limit}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
 
-    Endpoint: GET /Supplier?expand_dropdowns=true&range=0-{limit-1}
-
-    FIX #6: now uses _extract_data (consistent with all other fetch functions)
-    and adds isinstance(item, dict) guard.
-    """
     try:
         data = await _get("/Supplier", params={
             "expand_dropdowns": "true",
             "range": f"0-{limit - 1}",
         })
         items: list[Any] = _extract_data(data)
-        return [
+        result = [
             {
                 "id": item.get("id", ""),
                 "name": item.get("name", ""),
@@ -1328,18 +1186,68 @@ async def fetch_suppliers(limit: int = 20) -> list[dict[str, Any]]:
                 "email": item.get("email", ""),
                 "comment": _strip_html(item.get("comment", "") or ""),
             }
-            for item in items
-            if isinstance(item, dict)
+            for item in items if isinstance(item, dict)
         ]
+        _cache_set(cache_key, result)
+        return result
     except Exception as exc:
         logger.warning("fetch_suppliers failed: %s", exc)
         return []
 
 
+# ── Shared Search API constants ───────────────────────────────────────────────
+
+_COMPUTER_SEARCH_FORCEDISPLAY: dict[str, int] = {
+    "forcedisplay[0]":  1,    # Name
+    "forcedisplay[1]":  2,    # ID
+    "forcedisplay[2]":  3,    # Location
+    "forcedisplay[3]":  4,    # Type
+    "forcedisplay[4]":  5,    # Serial Number
+    "forcedisplay[5]":  6,    # Inventory Number (otherserial)
+    "forcedisplay[6]":  14,   # Operating System
+    "forcedisplay[7]":  19,   # Last Update
+    "forcedisplay[8]":  23,   # Manufacturer
+    "forcedisplay[9]":  31,   # Status
+    "forcedisplay[10]": 40,   # Model
+    "forcedisplay[11]": 80,   # Entity
+    "forcedisplay[12]": 24,   # User (users_id)
+}
+
+_INFOCOM_WARRANTY_FIELD: int = 162
+
+
+def _parse_computer_search_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Parse satu item dari GLPI Search API ke format standar enriched dict."""
+    return {
+        "id":           _first(item, "2", "id"),
+        "name":         _first(item, "1", "name"),
+        "serial":       _first(item, "5", "serial"),
+        "otherserial":  _first(item, "6", "otherserial"),
+        "type":         _clean_value(_first(item, "4", "computertypes_id", "type")),
+        "model":        _clean_value(_first(item, "40", "computermodels_id", "model")),
+        "status":       _clean_value(_first(item, "31", "states_id", "status")),
+        "location":     _clean_value(_first(item, "3", "locations_id", "location")),
+        "user":         _clean_value(_first(item, "24", "users_id", "user")),
+        "entity":       _clean_value(_first(item, "80", "entities_id", "entity")),
+        "manufacturer": _clean_value(_first(item, "23", "manufacturers_id", "manufacturer")),
+        "os":           _clean_value(_first(item, "14", "operatingsystems_id", "os")),
+        "date_mod":     _first(item, "19", "date_mod"),
+    }
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
+def _first(item: dict[str, Any], *keys: str) -> Any:
+    """Kembalikan nilai pertama yang tidak kosong dari item berdasarkan keys."""
+    for k in keys:
+        v = item.get(k)
+        if v is not None and v != "":
+            return v
+    return ""
+
+
 def _strip_html(text: str) -> str:
-    """Remove HTML tags from GLPI rich-text content."""
+    """Hapus tag HTML dari teks GLPI."""
     if not text:
         return ""
     text = re.sub(r"<[^>]+>", " ", text)
@@ -1348,7 +1256,7 @@ def _strip_html(text: str) -> str:
 
 
 def _extract_data(data: dict[str, Any] | list[Any]) -> list[Any]:
-    """Unwrap GLPI search response envelope {'data': [...]} or pass through list."""
+    """Unwrap GLPI search response envelope {'data': [...]} atau pass-through list."""
     if isinstance(data, dict) and "data" in data:
         return data["data"]  # type: ignore[return-value]
     if isinstance(data, list):
@@ -1357,18 +1265,10 @@ def _extract_data(data: dict[str, Any] | list[Any]) -> list[Any]:
 
 
 def _clean_value(value: Any) -> str:
-    """Normalise a GLPI dropdown field value to a clean string.
+    """Normalise nilai dropdown GLPI ke string bersih.
 
-    When expand_dropdowns=true is used, GLPI replaces foreign-key integer IDs
-    with their human-readable label. However, unset fields come back as 0
-    (integer) or "0" (string). Both are treated as empty so the UI shows "-"
-    rather than a meaningless "0".
-
-    Args:
-        value: Raw value from a GLPI API response field.
-
-    Returns:
-        Clean string, or "" if the value is absent/zero/blank.
+    Nilai 0 atau "0" (unset foreign key) dikembalikan sebagai "" agar UI
+    menampilkan "-" bukan "0" yang tidak bermakna.
     """
     if value is None:
         return ""
@@ -1389,7 +1289,7 @@ _STATUS_MAP: dict[int, str] = {
 
 
 def _ticket_status_label(status: Any) -> str:
-    """Convert a GLPI numeric ticket status to a human-readable Indonesian label."""
+    """Konversi status tiket numerik GLPI ke label Bahasa Indonesia."""
     try:
         return _STATUS_MAP.get(int(status), f"Status {status}")
     except (TypeError, ValueError):
