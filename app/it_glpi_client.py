@@ -23,6 +23,12 @@ All GET endpoints map 1-to-1 with the Postman collection:
     GET /ITILCategory                      → fetch_itil_categories()
     GET /Supplier                          → fetch_suppliers()
 
+CHANGELOG (v7.0 — Full Computer Detail & Supplier Smart Pagination):
+  - get_computer_by_id(): tambah with_documents=true; expose contact_num,
+    os_version, os_arch, doc_count, entity. OS resolve cascade.
+  - search_suppliers(): hard cap SUPPLIER_MAX_ENRICH (default 20) pada fase
+    enrich agar jumlah concurrent GET /Supplier/{id} tidak meledak.
+
 CHANGELOG (v4.0 — Smart Pagination):
   - Tambah _get_all_pages(): internal helper untuk auto-pagination yang
     mengambil semua halaman dari GLPI Search API secara efisien.
@@ -528,64 +534,108 @@ async def get_total_computers_count() -> int:
 
 
 async def get_computer_by_id(computer_id: int) -> dict[str, Any] | None:
-    """Fetch satu komputer dengan data finansial dan kontrak terkait.
+    """Fetch satu komputer dengan data lengkap: finansial, kontrak, OS, dan dokumen.
 
     Endpoint: GET /Computer/{id}?expand_dropdowns=true
-              &with_infocoms=true&with_contracts=true&with_operatingsystems=true
+              &with_infocoms=true&with_contracts=true
+              &with_operatingsystems=true&with_documents=true
+
+    CHANGELOG v7.0:
+      - Tambah with_documents=true untuk mendapatkan jumlah dokumen terlampir.
+      - Tambah field: contact (alternate username number), contact_num
+        (alternate username), os_version, os_arch, doc_count, entity.
+      - OS: strategi cascade — coba operatingsystems_id (expand_dropdowns),
+        lalu _operatingsystems[0].name, lalu _operatingsystems[0].operatingsystems_id.
+      - Manufacturer: sudah di-expand via expand_dropdowns=true (nama langsung
+        tersedia di manufacturers_id sebagai string).
     """
     try:
         data = await _get(f"/Computer/{computer_id}", params={
             "expand_dropdowns": "true",
-            "with_infocoms": "true",
-            "with_contracts": "true",
+            "with_infocoms":        "true",
+            "with_contracts":       "true",
             "with_operatingsystems": "true",
+            "with_documents":       "true",
         })
         if not isinstance(data, dict):
             return None
 
         infocoms: dict[str, Any] = data.get("_infocoms") or {}
 
+        # ── OS: cascade nama dari beberapa sumber ─────────────────────────────
+        # expand_dropdowns=true menggantikan ID dengan nama string di field
+        # *_id. Jika hasilnya masih angka, fallback ke _operatingsystems list.
         os_name: str = _clean_value(data.get("operatingsystems_id"))
-        if not os_name:
-            os_list: list[Any] = data.get("_operatingsystems") or []
-            if os_list and isinstance(os_list[0], dict):
+        os_version: str = ""
+        os_arch: str = ""
+
+        os_list: list[Any] = data.get("_operatingsystems") or []
+        if os_list and isinstance(os_list[0], dict):
+            os_item = os_list[0]
+            if not os_name:
                 os_name = _clean_value(
-                    os_list[0].get("operatingsystems_id")
-                    or os_list[0].get("name", "")
+                    os_item.get("operatingsystems_id")
+                    or os_item.get("name", "")
                 )
+            # Versi & arsitektur OS ada di sub-item _operatingsystems
+            os_version = _clean_value(
+                os_item.get("operatingsystemversions_id")
+                or os_item.get("version", "")
+            )
+            os_arch = _clean_value(
+                os_item.get("operatingsystemarchitectures_id")
+                or os_item.get("arch", "")
+            )
+
+        os_display = os_name
+        if os_version:
+            os_display = f"{os_name} {os_version}".strip()
+        if os_arch:
+            os_display = f"{os_display} ({os_arch})".strip()
+
+        # ── Jumlah dokumen terlampir ──────────────────────────────────────────
+        documents: list[Any] = data.get("_documents") or []
+        doc_count: int = len(documents) if isinstance(documents, list) else 0
 
         return {
-            "id": data.get("id", ""),
-            "name": data.get("name", ""),
-            "serial": data.get("serial", ""),
-            "otherserial": data.get("otherserial", ""),
-            "type": _clean_value(data.get("computertypes_id")),
-            "model": _clean_value(data.get("computermodels_id")),
-            "status": _clean_value(data.get("states_id")),
-            "location": _clean_value(data.get("locations_id")),
-            "user": _clean_value(data.get("users_id")),
-            "entity": _clean_value(data.get("entities_id")),
+            "id":           data.get("id", ""),
+            "name":         data.get("name", ""),
+            "entity":       _clean_value(data.get("entities_id")),
+            "serial":       data.get("serial", ""),
+            "otherserial":  data.get("otherserial", ""),
+            "location":     _clean_value(data.get("locations_id")),
+            "type":         _clean_value(data.get("computertypes_id")),
+            "model":        _clean_value(data.get("computermodels_id")),
             "manufacturer": _clean_value(data.get("manufacturers_id")),
-            "os": os_name,
-            "contact": data.get("contact", ""),
-            "comment": _strip_html(data.get("comment", "") or ""),
-            "date_mod": data.get("date_mod", ""),
-            # Infocom (financial) fields
-            "buy_date": infocoms.get("buy_date", ""),
-            "use_date": infocoms.get("use_date", ""),
+            # contact_num = "Alternate username number" di GLPI
+            # contact     = "Alternate username" di GLPI
+            "contact_num":  data.get("contact_num", ""),
+            "contact":      data.get("contact", ""),
+            "os":           os_display,
+            "os_name":      os_name,
+            "os_version":   os_version,
+            "os_arch":      os_arch,
+            "status":       _clean_value(data.get("states_id")),
+            "user":         _clean_value(data.get("users_id")),
+            "comment":      _strip_html(data.get("comment", "") or ""),
+            "doc_count":    doc_count,
+            "date_mod":     data.get("date_mod", ""),
+            # ── Infocom (Financial & Administrative) ──────────────────────────
+            "buy_date":          infocoms.get("buy_date", ""),
+            "use_date":          infocoms.get("use_date", ""),
             "warranty_duration": infocoms.get("warranty_duration", ""),
-            "warranty_date": infocoms.get("warranty_date", ""),
-            "value": infocoms.get("value", ""),
-            "supplier": infocoms.get("suppliers_id", ""),
-            # Linked contracts
+            "warranty_date":     infocoms.get("warranty_date", ""),
+            "value":             infocoms.get("value", ""),
+            "supplier":          _clean_value(infocoms.get("suppliers_id", "")),
+            # ── Linked contracts ──────────────────────────────────────────────
             "contracts": [
                 {
-                    "id": c.get("id", ""),
-                    "name": c.get("name", ""),
-                    "num": c.get("num", ""),
+                    "id":         c.get("id", ""),
+                    "name":       c.get("name", ""),
+                    "num":        c.get("num", ""),
                     "begin_date": c.get("begin_date", ""),
-                    "duration": c.get("duration", ""),
-                    "end_date": c.get("end_date", ""),
+                    "duration":   c.get("duration", ""),
+                    "end_date":   c.get("end_date", ""),
                 }
                 for c in (data.get("_contracts") or [])
                 if isinstance(c, dict)
@@ -1225,6 +1275,7 @@ RINGKASAN PERBAIKAN v5.1:
 
 # ── Suppliers ─────────────────────────────────────────────────────────────────
 #
+SUPPLIER_MAX_ENRICH: int = 8
 # Field ID untuk /search/Supplier (GLPI 10.x — verifikasi via /listSearchOptions/Supplier)
 # Digunakan HANYA untuk parameter criteria[] pada search request.
 # Untuk parsing hasil, kita fetch ulang via GET /Supplier/{id} agar field eksplisit.
@@ -1295,24 +1346,48 @@ async def _enrich_supplier_ids(
     Menggunakan GET /Supplier/{id}?expand_dropdowns=true agar field nama
     (phonenumber, fax, email, address, town, dll) selalu eksplisit dan benar.
 
+    Concurrency dibatasi via asyncio.Semaphore (maks 5 request simultan)
+    untuk mencegah beban berlebih pada server GLPI saat list supplier besar.
+
     Args:
         supplier_ids: List ID supplier integer.
 
     Returns:
         List dict supplier terparse, dengan item None yang difilter keluar.
     """
+    # v8.0: Concurrency diturunkan 5 → 3 agar server GLPI tidak kelebihan
+    # beban. Dengan SUPPLIER_MAX_ENRICH=8, maksimal 3 request berjalan
+    # bersamaan = lebih stabil di GLPI production.
+    semaphore = asyncio.Semaphore(3)
+
+    # v8.0: Per-request timeout 8 detik. Jika satu GET /Supplier/{id} tidak
+    # selesai dalam 8 detik (server lambat / congestion), skip dan kembalikan
+    # None — biarkan data lain tetap berjalan.
+    # Dengan 8 ID dan semaphore 3: worst case ≈ 3 batch × 8s = ~24s total.
+    _ENRICH_TIMEOUT_S: float = 8.0
+
     async def _fetch_one(sid: int | str) -> dict[str, Any] | None:
-        try:
-            data = await _get(
-                f"/Supplier/{sid}",
-                params={"expand_dropdowns": "true"},
-            )
-            if isinstance(data, dict) and data.get("id"):
-                return _parse_supplier_detail(data)
-            return None
-        except Exception as exc:
-            logger.debug("_enrich_supplier_ids: failed for id=%s: %s", sid, exc)
-            return None
+        async with semaphore:
+            try:
+                data = await asyncio.wait_for(
+                    _get(
+                        f"/Supplier/{sid}",
+                        params={"expand_dropdowns": "true"},
+                    ),
+                    timeout=_ENRICH_TIMEOUT_S,
+                )
+                if isinstance(data, dict) and data.get("id"):
+                    return _parse_supplier_detail(data)
+                return None
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "_enrich_supplier_ids: timeout (%.0fs) for id=%s — skip",
+                    _ENRICH_TIMEOUT_S, sid,
+                )
+                return None
+            except Exception as exc:
+                logger.debug("_enrich_supplier_ids: failed for id=%s: %s", sid, exc)
+                return None
 
     tasks = [_fetch_one(sid) for sid in supplier_ids]
     results = await asyncio.gather(*tasks, return_exceptions=False)
@@ -1408,7 +1483,7 @@ async def search_suppliers(
     # ── Fase 1: GET /search/Supplier → ambil ID list + totalcount ─────────────
     try:
         # Minta sample_size = limit agar pagination minimal
-        search_params = {**base_params, "range": f"0-{min(limit, 50) - 1}"}
+        search_params = {**base_params, "range": f"0-{min(limit, SUPPLIER_MAX_ENRICH) - 1}"}
         raw = await _get("/search/Supplier", params=search_params)
     except Exception as exc:
         logger.error("search_suppliers: search phase failed: %s", exc)
@@ -1424,10 +1499,20 @@ async def search_suppliers(
     if not search_items:
         return PagedResult(items=[], totalcount=totalcount, fetched=0, truncated=False)
 
+    # ── Hard cap: jumlah supplier yang akan di-enrich (fase 2) ───────────────
+    # v8.0: Diturunkan 20 → 8.
+    # Alasan: 20 concurrent GET /Supplier/{id} (meski dibatasi semaphore 5)
+    # tetap memakan ~15-25 detik pada GLPI lambat → akumulasi agent loop
+    # melewati timeout 110 detik.
+    # 8 supplier = ~6-10 detik enrich, cukup representatif, aman untuk
+    # LLM token budget, dan tidak memicu looping agent berulang.
+    # totalcount exact tetap dikembalikan sehingga LLM tahu jumlah sebenarnya.
+    
+
     # Extract supplier IDs dari search response
     # Search API mengembalikan field "2" sebagai ID (sesuai forcedisplay[0]=2)
     supplier_ids: list[int | str] = []
-    for item in search_items[:limit]:
+    for item in search_items[:min(limit, SUPPLIER_MAX_ENRICH)]:
         sid = _first(item, "2", "id")
         if sid and str(sid) not in ("", "0"):
             try:
@@ -1447,7 +1532,7 @@ async def search_suppliers(
                 "fax":     "",
                 "email":   "",
             }
-            for item in search_items[:limit]
+            for item in search_items[:min(limit, SUPPLIER_MAX_ENRICH)]
         ]
         return PagedResult(
             items=fallback_items,
@@ -1460,6 +1545,7 @@ async def search_suppliers(
     enriched = await _enrich_supplier_ids(supplier_ids)
 
     fetched = len(enriched)
+    # truncated = True jika totalcount lebih besar dari yang kita enrich
     truncated = totalcount > fetched
 
     logger.info(

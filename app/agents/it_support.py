@@ -5,6 +5,9 @@ LLM diterima sebagai parameter dari crew_services.py sehingga inisialisasi
 terpusat di satu tempat dan agent ini tetap stateless & testable.
 
 CHANGELOG:
+  v6.0 — max_iter 15 → 8 untuk mengurangi latency pada query sederhana.
+          Singleton LLM/Agent kini dikelola di crew_services.py; build_it_support
+          tetap ada sebagai factory untuk inisialisasi awal singleton.
   v5.1 — Tambah tool_count_suppliers.
   v3.0 — Backstory rewrite: anti-hallucination, larangan Thought/Action di output.
 """
@@ -61,6 +64,12 @@ atau proses berpikir internal.
 "tiket itu") → gunakan data riwayat, JANGAN panggil tool lagi.
 6. Jika user_id=0 dan user bertanya data milik sendiri → sampaikan sistem belum \
 mendeteksi identitas, minta hubungi admin IT.
+7. ATURAN DATA BESAR — WAJIB: Jika output tool berisi "[INSTRUKSI SISTEM — WAJIB DIIKUTI]" \
+atau "[INSTRUKSI SISTEM]" → TULIS Final Answer LANGSUNG. \
+DILARANG keras memanggil tool apapun lagi setelah menerima instruksi tersebut. \
+Sistem sudah memberikan totalcount exact — cukup sebut angka itu dan tampilkan \
+sampel yang ada. Looping untuk mendapat "semua data" = PELANGGARAN ATURAN yang \
+menyebabkan sistem timeout dan user tidak mendapat jawaban sama sekali.
 
 PERINGATAN: Jika kamu mendapati diri menulis "Thought:" atau "Action:" di Final Answer \
 — itu SALAH TOTAL. Panggil tool secara nyata, tunggu hasilnya, baru tulis Final Answer.
@@ -111,6 +120,11 @@ def build_it_support(llm: LLM, glpi_user_id: int = 0) -> Agent:  # noqa: ARG001
         llm=llm,
         verbose=settings.crew_verbose,
         allow_delegation=False,
-        max_iter=15,
+        # v8.0: Turun dari 8 → 6.
+        # Dengan instruksi anti-loop yang lebih kuat di backstory & task,
+        # agent seharusnya selesai dalam 2-3 iterasi (1 tool call + Final Answer).
+        # 6 iterasi = safety net yang lebih ketat tanpa memotong query legitimate
+        # yang butuh 2-3 tool call berbeda (misal: count + list + detail).
+        max_iter=8,
         max_retry_limit=2,
     )

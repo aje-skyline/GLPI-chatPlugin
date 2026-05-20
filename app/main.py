@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.crew_services import run_crew
+from app.crew_services import run_crew, run_crew_async
 from app import it_glpi_client
 
 logger = logging.getLogger(__name__)
@@ -143,6 +143,24 @@ def _resolve_user_id(body: dict, user_message: str, session_id: str) -> int:
 
     return glpi_user_id
 
+_MAX_STORED_ANSWER_LEN: int = 500
+
+def _compress_for_history(answer: str) -> str:
+    """Ringkas jawaban panjang sebelum disimpan ke session history."""
+    if len(answer) <= _MAX_STORED_ANSWER_LEN:
+        return answer
+    return (
+        answer[:_MAX_STORED_ANSWER_LEN]
+        + "\n… [ringkasan: jawaban asli lebih panjang. "
+        + "Agent dapat memanggil tool kembali jika user butuh detail lengkap.]"
+    )
+
+def _save_to_session(session_id: str, messages: list[dict[str, str]], answer: str) -> None:
+    """Simpan riwayat percakapan ke session, dengan kompresi untuk jawaban panjang."""
+    compressed = _compress_for_history(answer)
+    assistant_msg = {"role": "assistant", "content": compressed}
+    _session_messages[session_id] = (messages + [assistant_msg])[-_MAX_SESSION_MESSAGES:]
+    _session_last_seen[session_id] = time.time()
 
 def _save_to_session(session_id: str, messages: list[dict[str, str]], answer: str) -> None:
     """Simpan riwayat percakapan ke session."""
@@ -179,12 +197,36 @@ async def _stream_crew_response(
     user_message: str,
     glpi_user_id: int,
 ) -> AsyncGenerator[str, None]:
-    
+    """SSE generator yang mengalirkan thought CrewAI secara real-time.
+
+    Arsitektur aliran data:
+    ┌─────────────────────────────────────────────────────────────┐
+    │  kickoff_async()  →  asyncio.to_thread(kickoff)            │
+    │       ↓                                                     │
+    │  step_callback() [worker thread]                           │
+    │       ↓  run_coroutine_threadsafe                          │
+    │  asyncio.Queue  ←────────────────────────────────────────  │
+    │       ↓  await queue.get(timeout=3s)                       │
+    │  SSE generator  →  yield _sse_event("thought", ...)       │
+    │       ↓                                                     │
+    │  Client browser / Axios                                    │
+    └─────────────────────────────────────────────────────────────┘
+
+    Jika tidak ada thought dalam 3 detik, generator mengirim keep-alive ping
+    dan status cycling agar koneksi HTTP tidak dianggap mati oleh client/proxy.
+    Sentinel None dari queue menandakan crew selesai → lanjut stream Final Answer.
+    """
     model_label = settings.ai_model
 
-    loop = asyncio.get_event_loop()
-    crew_future = loop.run_in_executor(
-        None, run_crew, user_message, glpi_user_id, messages
+    # ── Queue sebagai jembatan thread ↔ async ────────────────────────────────
+    # Unbounded queue; crew tidak akan diproduksi lebih cepat dari konsumsi SSE.
+    step_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    # ── Jalankan crew sebagai coroutine (bukan thread pool manual) ────────────
+    # run_crew_async() menggunakan kickoff_async() → asyncio.to_thread() secara
+    # internal — event loop FastAPI TIDAK ter-block selama crew berjalan.
+    crew_task = asyncio.create_task(
+        run_crew_async(user_message, glpi_user_id, messages, step_queue)
     )
 
     status_cycle = [
@@ -194,39 +236,98 @@ async def _stream_crew_response(
         "Menyiapkan jawaban…",
         "Hampir selesai…",
     ]
-    idx = 0
-    tick = 0
+    status_idx = 0
+    start_time = asyncio.get_event_loop().time()
+    # v8.0: Turun dari 110s → 80s.
+    # Dengan SUPPLIER_MAX_ENRICH=8 dan enrich timeout 8s per-request,
+    # query supplier bahkan yang paling lambat seharusnya selesai < 40s.
+    # 80s memberi headroom 2× sekaligus abort lebih awal daripada 110s,
+    # mengurangi waktu tunggu user saat ada edge-case loop/hang.
+    _SERVER_TIMEOUT_S = 80  # Batalkan server-side sebelum client timeout 120s
 
-    while not crew_future.done():
-        await asyncio.sleep(0.5)
-        tick += 1
+    # ── Loop utama: konsumsi thought dari queue ───────────────────────────────
+    while True:
+        elapsed = asyncio.get_event_loop().time() - start_time
 
-        if tick % 4 == 0:
-            yield _sse_event("status", {"message": status_cycle[idx % len(status_cycle)]})
-            idx += 1
+        # Server-side timeout guard
+        if elapsed >= _SERVER_TIMEOUT_S:
+            crew_task.cancel()
+            logger.error(
+                "Crew async cancelled after %.0fs (server timeout) for session=%s",
+                elapsed, session_id[:20],
+            )
+            yield _sse_event("error", {
+                "error": "Waktu pemrosesan habis. Silakan coba lagi dengan pertanyaan yang lebih spesifik."
+            })
+            return
 
-        if tick % 10 == 0:
-            yield _sse_event("heartbeat", {"state": "waiting"})
+        try:
+            # Tunggu step thought dengan timeout 3 detik.
+            # Jika timeout → kirim keep-alive, lanjut loop.
+            # Jika dapat None (sentinel) → crew selesai, keluar loop.
+            # Jika dapat teks → stream sebagai thought event.
+            step_text: str | None = await asyncio.wait_for(
+                step_queue.get(), timeout=3.0
+            )
+        except asyncio.TimeoutError:
+            # Tidak ada thought 3 detik → kirim keep-alive agar koneksi hidup.
+            # ": ping" adalah SSE comment resmi yang RESET timer Nginx/proxy/Axios
+            # tanpa menghasilkan event di client.
+            yield ": ping\n\n"
+            # Empty OpenAI delta chunk → reset timer SDK yang strict
+            yield _sse_openai_chunk("", model_label)
+            # Rotasi pesan status agar terlihat aktif di UI
+            yield _sse_event("status", {
+                "message": status_cycle[status_idx % len(status_cycle)]
+            })
+            status_idx += 1
+            continue
 
-    # ── Get result ────────────────────────────────────────────────────────────
+        # Sentinel None = crew selesai (normal atau error)
+        if step_text is None:
+            break
+
+        # Stream thought agent sebagai SSE event khusus.
+        # Client dapat menampilkan ini sebagai "thinking indicator" atau log.
+        # Thought sengaja dipotong (sudah dibatasi 400 char di _extract_step_text)
+        # agar tidak membanjiri client dengan teks panjang.
+        yield _sse_event("thought", {
+            "content": step_text,
+            "elapsed_s": round(asyncio.get_event_loop().time() - start_time, 1),
+        })
+
+    # ── Ambil hasil final dari crew_task ─────────────────────────────────────
     try:
-        final_answer: str = await crew_future
+        final_answer: str = await crew_task
+    except asyncio.CancelledError:
+        logger.error("Crew task cancelled for session=%s", session_id[:20])
+        yield _sse_event("error", {
+            "error": "Waktu pemrosesan habis. Silakan coba lagi dengan pertanyaan yang lebih spesifik."
+        })
+        return
     except Exception as exc:
         logger.exception("Crew error in streaming mode for session=%s", session_id[:20])
-        yield _sse_event("error", {"error": f"Crew Error: {exc}"})
+        err_msg = str(exc).lower()
+        if "timed out" in err_msg or "timeout" in err_msg:
+            yield _sse_event("error", {
+                "error": "Waktu pemrosesan habis. Silakan coba lagi dengan pertanyaan yang lebih spesifik."
+            })
+        else:
+            yield _sse_event("error", {"error": f"Crew Error: {exc}"})
         return
 
-    # Langsung gunakan final_answer karena sudah murni dari SDK
     _save_to_session(session_id, messages, final_answer)
 
-    yield _sse_event("meta", {"model": model_label})
+    total_elapsed = round(asyncio.get_event_loop().time() - start_time, 1)
+    yield _sse_event("meta", {"model": model_label, "elapsed_s": total_elapsed})
 
-    # Stream final_answer word-by-word
+    # ── Stream Final Answer kata per kata ─────────────────────────────────────
+    # Memberikan efek "mengetik" di UI; delay 30ms per kata terasa natural.
     words = final_answer.split(" ")
     for i, word in enumerate(words):
         chunk = word if i == len(words) - 1 else word + " "
         yield _sse_openai_chunk(chunk, model_label)
-        await asyncio.sleep(0.03) 
+        await asyncio.sleep(0.03)
 
     yield _sse_openai_chunk("", model_label, finish_reason="stop")
     yield "data: [DONE]\n\n"
@@ -349,8 +450,13 @@ async def chat_completions(request: Request, response: Response):
 
     try:
         loop = asyncio.get_event_loop()
-        final_answer: str = await loop.run_in_executor(
-            None, run_crew, user_message, glpi_user_id, messages
+        # v8.0: Tambah asyncio.wait_for dengan timeout 80s agar non-streaming
+        # path juga terlindungi (sebelumnya tidak ada timeout eksplisit di sini).
+        final_answer: str = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, run_crew, user_message, glpi_user_id, messages
+            ),
+            timeout=80.0,
         )
 
         _save_to_session(session_id, messages, final_answer)
@@ -367,6 +473,12 @@ async def chat_completions(request: Request, response: Response):
             }],
         }
 
+    except asyncio.TimeoutError as te:
+        logger.error("Crew execution timed out for user_id=%s", glpi_user_id)
+        raise HTTPException(
+            status_code=504,
+            detail="Waktu pemrosesan habis. Silakan coba lagi dengan pertanyaan yang lebih spesifik."
+        ) from te
     except Exception as exc:
         logger.exception("Crew error for user_id=%s", glpi_user_id)
         raise HTTPException(status_code=500, detail=f"Crew Error: {exc}") from exc

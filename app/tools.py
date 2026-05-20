@@ -3,6 +3,25 @@
 Setiap tool adalah subclass BaseTool dengan Pydantic input schema yang ketat.
 Tools dipanggil oleh IT Support Agent berdasarkan intent user.
 
+CHANGELOG v7.0 — Full Computer Detail & Supplier Smart Pagination:
+  - Tambah _fmt_computer_full_detail(): formatter khusus GetComputerDetailTool
+    yang menampilkan seluruh 16 field yang diminta (Name, Entity, Serial, dst.)
+    dalam format key-value kolom yang lengkap dan terbaca.
+  - GetComputerDetailTool: beralih menggunakan _fmt_computer_full_detail()
+    (bukan _fmt_computer_row(detail=True) yang terpotong).
+  - _render_supplier_result(): tambah smart pagination — jika totalcount >
+    SUPPLIER_SAMPLE_THRESHOLD (default 20), tampilkan header totalcount +
+    sampel saja, bukan semua baris. Menghilangkan timeout token explosion.
+  - SearchSuppliersTool: deskripsi diperbarui: ingatkan LLM bahwa output
+    hanya sampel jika supplier banyak.
+
+CHANGELOG v6.0 — Caching & Concurrency:
+  - Tambah cache_function=True pada tool yang hasilnya stabil dalam satu sesi:
+    SearchKnowledgeBaseTool, GetAllComputersTool, GetCategoriesTool,
+    ListSearchOptionsTool. Mencegah redundant API call saat agent loop
+    memanggil tool yang sama dengan argumen identik.
+  - Fix typo: cahce_function → cache_function di CountSuppliersTool.
+
 CHANGELOG v4.0 — Smart Pagination & Summary:
   - _fmt_computer_row() diperbarui: output lebih ringkas (hemat token ~40%).
   - _fmt_paged_header(): helper baru untuk header summary data paginated.
@@ -45,6 +64,17 @@ SUMMARY_THRESHOLD: int = 100
 # Jumlah baris detail yang ditampilkan ke LLM saat data melebihi SUMMARY_THRESHOLD.
 # Dipilih cukup untuk representatif, tapi tidak overflow context window.
 SAMPLE_FOR_LLM: int = 50
+
+# Threshold supplier: jika totalcount > nilai ini, render hanya sampel + header.
+# v8.0: Diturunkan 10 → 5. Dengan SUPPLIER_MAX_ENRICH=8, threshold 10 masih
+# membuat kondisi `8 > 10` = False → semua 8 supplier dikirim ke LLM.
+# Threshold 5 memastikan bahkan query dengan 6+ supplier LANGSUNG masuk jalur
+# sampel, mencegah token explosion dari baris data yang panjang.
+SUPPLIER_SAMPLE_THRESHOLD: int = 5
+
+# Jumlah baris supplier yang benar-benar dikirim ke LLM saat totalcount > threshold.
+# v8.0: Tetap 5. 5 baris × 6 field ≈ 30 baris teks — representatif dan aman.
+SUPPLIER_DISPLAY_MAX: int = 5
 
 
 # ── Persistent background event loop ─────────────────────────────────────────
@@ -155,6 +185,137 @@ def _fmt_computer_row(idx: int, comp: dict[str, Any], detail: bool = False) -> s
             end = c.get("end_date") or "(tidak ada)"
             lines.append(f"     - {c.get('name', '-')} (ID: {c.get('id', '-')}) | Berakhir: {end}")
 
+    return "\n".join(lines) + "\n"
+
+
+def _fmt_computer_full_detail(comp: dict[str, Any]) -> str:
+    """Format detail lengkap SATU komputer untuk GetComputerDetailTool.
+
+    Menampilkan semua 16 field standar dalam format key-value kolom yang
+    konsisten dan mudah dibaca oleh LLM maupun user. Setiap field selalu
+    ditampilkan (dengan nilai "(tidak ada)" jika kosong) sehingga tidak ada
+    informasi yang tersembunyi karena kondisional.
+
+    Field yang ditampilkan (sesuai permintaan):
+      1.  Name
+      2.  Entity
+      3.  Serial Number
+      4.  Inventory Number (otherserial)
+      5.  Location
+      6.  Type
+      7.  Model
+      8.  Manufacturer
+      9.  Alternate Username Number (contact_num)
+      10. Alternate Username (contact)
+      11. Operating System - Name
+      12. Status
+      13. Financial - Startup Date (use_date)
+      14. Comments
+      15. Documents - Number of Documents
+      16. Last Update
+
+    Field tambahan yang informatif juga ditampilkan jika tersedia:
+      - OS Version & Architecture (dari _operatingsystems)
+      - Supplier (dari infocom)
+      - Kontrak terkait (nama, nomor, tanggal berakhir)
+    """
+    def _v(key: str) -> str:
+        """Ambil nilai field, kembalikan '(tidak ada)' jika kosong."""
+        val = comp.get(key)
+        if val is None or str(val).strip() in ("", "0", "None"):
+            return "(tidak ada)"
+        return str(val).strip()
+
+    cid  = comp.get("id") or "-"
+    name = comp.get("name") or "-"
+
+    # Header
+    lines = [
+        f"══════════════════════════════════════════════",
+        f"  Detail Komputer: {name}  (ID: {cid})",
+        f"══════════════════════════════════════════════",
+        "",
+        "── Identitas ──────────────────────────────────",
+    ]
+
+    W = 28  # lebar kolom label
+
+    def _row(label: str, value: str) -> str:
+        return f"  {label:<{W}}: {value}"
+
+    lines += [
+        _row("Name",                      name),
+        _row("Entity",                    _v("entity")),
+        _row("Serial Number",             _v("serial")),
+        _row("Inventory Number",          _v("otherserial")),
+        _row("Location",                  _v("location")),
+        _row("Type",                      _v("type")),
+        _row("Model",                     _v("model")),
+        _row("Manufacturer",              _v("manufacturer")),
+        _row("Alternate Username Number", _v("contact_num")),
+        _row("Alternate Username",        _v("contact")),
+        "",
+        "── Sistem Operasi ─────────────────────────────",
+        _row("Operating System - Name",   _v("os")),
+    ]
+
+    # Tampilkan versi & arsitektur hanya jika tersedia secara terpisah
+    if comp.get("os_version") and comp.get("os_version") not in (comp.get("os"), ""):
+        lines.append(_row("  OS Version",           _v("os_version")))
+    if comp.get("os_arch"):
+        lines.append(_row("  OS Architecture",      _v("os_arch")))
+
+    lines += [
+        "",
+        "── Status & Pengguna ──────────────────────────",
+        _row("Status",                    _v("status")),
+        _row("User",                      _v("user")),
+        "",
+        "── Informasi Finansial & Administratif ────────",
+        _row("Startup Date (use_date)",   _v("use_date")),
+        _row("Buy Date",                  _v("buy_date")),
+        _row("Warranty Duration",
+             f"{_v('warranty_duration')} bulan" if comp.get("warranty_duration") else "(tidak ada)"),
+        _row("Warranty Expiry",           _v("warranty_date")),
+        _row("Asset Value",               _v("value")),
+        _row("Supplier (Financial)",      _v("supplier")),
+        "",
+        "── Dokumen & Catatan ──────────────────────────",
+    ]
+
+    doc_count = comp.get("doc_count", 0)
+    lines.append(_row("Documents - Number",   str(doc_count) if doc_count else "0"))
+
+    comment = comp.get("comment", "").strip()
+    if comment:
+        # Potong komentar panjang agar tidak meledak token
+        comment_display = comment[:400] + ("..." if len(comment) > 400 else "")
+        lines.append(_row("Comments",             comment_display))
+    else:
+        lines.append(_row("Comments",             "(tidak ada)"))
+
+    lines += [
+        "",
+        "── Metadata ───────────────────────────────────",
+        _row("Last Update",               _v("date_mod")),
+    ]
+
+    # Kontrak terkait
+    contracts: list[dict[str, Any]] = comp.get("contracts") or []
+    if contracts:
+        lines.append("")
+        lines.append("── Kontrak Terkait ─────────────────────────────")
+        for c in contracts:
+            c_name = c.get("name") or "-"
+            c_num  = c.get("num") or "(no num)"
+            c_end  = c.get("end_date") or "(tidak ada)"
+            c_id   = c.get("id") or "-"
+            lines.append(f"  • {c_name} (ID: {c_id}) | No: {c_num} | Berakhir: {c_end}")
+    else:
+        lines.append("")
+        lines.append(_row("Kontrak Terkait",        "(tidak ada)"))
+
+    lines.append("══════════════════════════════════════════════")
     return "\n".join(lines) + "\n"
 
 
@@ -329,6 +490,10 @@ class SearchKnowledgeBaseTool(BaseTool):
         "atau bertanya tentang prosedur/kebijakan IT."
     )
     args_schema: Type[BaseModel] = SearchKnowledgeBaseInput
+    # Cache aktif: hasil KB jarang berubah dalam satu sesi — aman di-cache
+    # per kombinasi argumen oleh CrewAI agar tool yang sama tidak dipanggil
+    # dua kali dengan query identik dalam satu agent loop.
+    cache_function: Any = Field(default=lambda tool_name, tool_args: True)
 
     def _run(self, query: str) -> str:
         logger.info("Tool KB | query='%s'", query)
@@ -427,6 +592,9 @@ class GetAllComputersTool(BaseTool):
         "JANGAN gunakan untuk aset milik user tertentu — gunakan get_user_assets."
     )
     args_schema: Type[BaseModel] = GetAllComputersInput
+    # Cache aktif: inventaris tidak berubah dalam hitungan detik; caching mencegah
+    # agent memanggil tool ini berkali-kali dengan argumen sama dalam satu request.
+    cache_function: Any = Field(default=lambda tool_name, tool_args: True)
 
     def _run(
         self,
@@ -466,8 +634,10 @@ class GetComputerDetailInput(BaseModel):
 class GetComputerDetailTool(BaseTool):
     name: str = "get_computer_detail"
     description: str = (
-        "Ambil detail LENGKAP satu komputer berdasarkan ID-nya, termasuk Type, Model, "
-        "Serial Number, Lokasi, Status, data finansial, dan kontrak terkait. "
+        "Ambil detail LENGKAP satu komputer berdasarkan ID-nya, termasuk: "
+        "Name, Entity, Serial Number, Inventory Number, Location, Type, Model, "
+        "Manufacturer, Alternate Username, Operating System, Status, "
+        "Financial/Startup Date, Comments, Documents count, dan Last Update. "
         "WAJIB dipanggil saat user meminta 'data lengkap', 'detail', atau 'info lengkap' "
         "suatu komputer — meskipun nama komputer sudah ada di riwayat percakapan."
     )
@@ -478,7 +648,8 @@ class GetComputerDetailTool(BaseTool):
             comp = _run_async(it_glpi_client.get_computer_by_id(computer_id))
             if not comp:
                 return f"Komputer dengan ID {computer_id} tidak ditemukan di GLPI."
-            return f"Detail Komputer (ID: {computer_id}):\n\n" + _fmt_computer_row(1, comp, detail=True)
+            # Gunakan formatter full-detail khusus tool ini (bukan _fmt_computer_row)
+            return _fmt_computer_full_detail(comp)
         except Exception as exc:
             return f"Gagal mengambil detail komputer: {exc}"
 
@@ -849,6 +1020,8 @@ class ListSearchOptionsTool(BaseTool):
     name: str = "list_search_options"
     description: str = "Ambil daftar field (opsi pencarian) yang tersedia untuk tipe item GLPI."
     args_schema: Type[BaseModel] = ListSearchOptionsInput
+    # Cache aktif: search options statis per GLPI version — tidak perlu re-fetch.
+    cache_function: Any = Field(default=lambda tool_name, tool_args: True)
 
     def _run(self, itemtype: str) -> str:
         try:
@@ -1007,6 +1180,8 @@ class GetCategoriesTool(BaseTool):
     name: str = "get_itil_categories"
     description: str = "Ambil daftar kategori ITIL yang tersedia untuk pembuatan tiket."
     args_schema: Type[BaseModel] = GetCategoriesInput
+    # Cache aktif: kategori ITIL sangat jarang berubah — safe to cache per session.
+    cache_function: Any = Field(default=lambda tool_name, tool_args: True)
 
     def _run(self, limit: int = 20) -> str:
         try:
@@ -1054,7 +1229,19 @@ def _render_supplier_result(
     result: "PagedResult",
     filter_label: str = "",
 ) -> str:
-    """Render PagedResult supplier menjadi string LLM-friendly."""
+    """Render PagedResult supplier menjadi string LLM-friendly.
+
+    CHANGELOG v7.1 — Hard-Limit Sample & Stop Instruction:
+      - Threshold turun: SUPPLIER_SAMPLE_THRESHOLD 30 → 10.
+        Kasus nyata: 30 supplier → threshold lama (30) membuat `30 > 30` = False
+        → SEMUA 20 baris (cap enrich) dikirim ke LLM → agent looping 3 menit,
+        7000+ token, timeout UI 120s.
+      - Display cap: SUPPLIER_DISPLAY_MAX (5).
+        5 baris = representasi cukup; jauh di bawah token budget aman.
+      - Suntik [INSTRUKSI SISTEM] di akhir output saat data besar.
+        Instruksi ini memaksa agent langsung ke Final Answer tanpa mencoba
+        melooping sisa data. Root cause fix untuk token explosion.
+    """
     items      = result["items"]
     totalcount = result["totalcount"]
     fetched    = result["fetched"]
@@ -1067,31 +1254,61 @@ def _render_supplier_result(
     total_fmt  = f"{totalcount:,}".replace(",", ".")
     filter_str = f" {filter_label}" if filter_label else ""
 
-    if not truncated:
+    is_large = totalcount > SUPPLIER_SAMPLE_THRESHOLD
+    # v7.1: Gunakan SUPPLIER_DISPLAY_MAX (5) sebagai batas keras baris ke LLM.
+    # Dengan SUPPLIER_SAMPLE_THRESHOLD=10, query "semua supplier" (30 item)
+    # langsung masuk jalur sampel → hanya 5 baris ke LLM → aman untuk token budget.
+    display_items = items[:SUPPLIER_DISPLAY_MAX] if is_large else items
+
+    if not truncated and not is_large:
+        # Semua data kecil (≤ 10) — tampilkan semua tanpa warning
         header = f"✅ Ditemukan {total_fmt} supplier{filter_str}.\n\n"
     else:
-        sample_fmt = f"{fetched:,}".replace(",", ".")
+        sample_fmt = f"{len(display_items):,}".replace(",", ".")
         header = (
             f"✅ Total: **{total_fmt} supplier** ditemukan{filter_str}.\n"
-            f"⚠️  Menampilkan {sample_fmt} data pertama. "
-            f"Gunakan filter lebih spesifik untuk mempersempit hasil.\n\n"
+            f"⚠️  Menampilkan {sample_fmt} sampel pertama dari {total_fmt}. "
+            f"Gunakan filter (name/entity/address/phone/email) untuk mempersempit hasil.\n\n"
         )
 
     rows = "".join(
         _fmt_supplier_row(idx, s) + "\n"
-        for idx, s in enumerate(items, 1)
+        for idx, s in enumerate(display_items, 1)
     )
 
     footer = ""
-    if truncated:
-        remaining     = totalcount - fetched
+    if is_large or truncated:
+        remaining     = totalcount - len(display_items)
         remaining_fmt = f"{remaining:,}".replace(",", ".")
         footer = (
             f"\n📌 ... dan {remaining_fmt} supplier lainnya tidak ditampilkan. "
-            f"Gunakan filter (name/entity/address/phone/fax/email) untuk mempersempit pencarian.\n"
+            f"Gunakan filter (name/entity/address/phone/fax/email) "
+            f"atau cari dengan nama spesifik untuk hasil lebih sempit.\n"
         )
 
-    return header + rows + footer
+    # ── v7.0: Suntik instruksi sistem untuk hentikan agent loop ──────────────
+    # Instruksi ini wajib ada saat data besar (is_large=True).
+    # Tujuan: mencegah agent memanggil tool lagi / menulis ulang semua baris.
+    # Format [INSTRUKSI SISTEM] sengaja mencolok agar diproses agent sebagai
+    # perintah eksplisit, bukan sekadar komentar.
+    # v8.0: Diperkuat — tambah aturan eksplisit bahwa memanggil tool lagi
+    # adalah KESALAHAN, dan Final Answer harus ditulis SEKARANG.
+    stop_instruction = ""
+    if is_large or truncated:
+        stop_instruction = (
+            f"\n\n[INSTRUKSI SISTEM — WAJIB DIIKUTI]:\n"
+            f"Data supplier sudah diterima. Sistem membatasi tampilan untuk "
+            f"menjaga performa — INI BUKAN ERROR.\n"
+            f"TINDAKAN YANG HARUS DILAKUKAN SEKARANG:\n"
+            f"1. TULIS Final Answer langsung — JANGAN panggil tool apapun lagi.\n"
+            f"2. Gunakan angka exact dari header: {total_fmt} supplier terdaftar.\n"
+            f"3. Tampilkan {len(display_items)} supplier di atas sebagai contoh.\n"
+            f"4. Arahkan user untuk filter jika butuh supplier spesifik.\n"
+            f"MEMANGGIL TOOL LAGI SETELAH INSTRUKSI INI = PELANGGARAN ATURAN.\n"
+            f"TULIS Final Answer SEKARANG!"
+        )
+
+    return header + rows + footer + stop_instruction
 
 
 # ── CountSuppliersTool ─────────────────────────────────────────────────────
@@ -1113,7 +1330,7 @@ class CountSuppliersTool(BaseTool):
         "Untuk list atau cari supplier, gunakan get_suppliers."
     )
     args_schema: Type[BaseModel] = CountSuppliersInput
-    cahce_function: Any = Field(default=lambda *args, **kwargs: False)
+    cache_function: Any = Field(default=lambda *args, **kwargs: False)
 
     def _run(self, **kwargs: Any) -> str:
         try:
@@ -1145,12 +1362,13 @@ class SupplierSearchInput(BaseModel):
     fax:     Optional[str] = Field(default=None, description="Filter nomor fax.")
     email:   Optional[str] = Field(default=None, description="Filter alamat email.")
     limit:   int           = Field(
-        default=50,
+        default=20,
         ge=1,
-        le=500,
+        le=20,
         description=(
-            "Jumlah maksimal hasil (1–500, default 50). "
-            "JANGAN set limit besar hanya untuk count — gunakan count_suppliers."
+            "Jumlah maksimal hasil (1–20, default 20). "
+            "Sistem membatasi enrich supplier ke 8 item untuk menjaga stabilitas token & waktu. "
+            "Gunakan count_suppliers jika hanya butuh angka total."
         ),
     )
 
@@ -1167,12 +1385,12 @@ class SearchSuppliersTool(BaseTool):
     name: str = "get_suppliers"
     description: str = (
         "Cari dan tampilkan daftar supplier/vendor yang terdaftar di GLPI. "
-        "Mendukung filter opsional berdasarkan: "
-        "name (nama supplier), entity (entity GLPI), address (alamat/kota), "
-        "phone (nomor telepon), fax (nomor fax), email (alamat email). "
-        "Semua filter bersifat opsional — jika tidak diisi, semua supplier ditampilkan. "
-        "Output menampilkan: Nama, Entity, Alamat, Telepon, Fax, Email. "
-        "Untuk HANYA menghitung jumlah total supplier, gunakan count_suppliers (lebih cepat)."
+        "Mendukung filter opsional: name, entity, address, phone, fax, email. "
+        "Jika supplier banyak (> 5), output menampilkan total exact + sampel 5 pertama "
+        "beserta [INSTRUKSI SISTEM — WAJIB DIIKUTI] untuk langsung memberikan Final Answer — "
+        "TIDAK BOLEH memanggil tool ini lagi setelah menerima instruksi tersebut. "
+        "Output per supplier: Nama, Entity, Alamat, Telepon, Fax, Email. "
+        "Untuk HANYA menghitung jumlah total, gunakan count_suppliers (lebih cepat)."
     )
     args_schema: Type[BaseModel] = SupplierSearchInput
 
@@ -1216,7 +1434,12 @@ class SearchSuppliersTool(BaseTool):
                     email=email,
                     limit=limit,
                 ),
-                timeout=90.0,
+                # v8.0: Turun dari 90s → 45s.
+                # Dengan SUPPLIER_MAX_ENRICH=8 dan semaphore=3, worst case
+                # ≈ 3 batch × 8s timeout = ~24s total enrich + overhead.
+                # 45s memberi headroom 2× sekaligus memaksa gagal lebih cepat
+                # daripada menunggu sampai server timeout 110s.
+                timeout=45.0,
             )
             return _render_supplier_result(result, filter_label=filter_label)
 
