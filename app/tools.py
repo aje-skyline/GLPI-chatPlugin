@@ -33,7 +33,7 @@ from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 
 from app import it_glpi_client
-from app.it_glpi_client import PagedResult
+from app.it_glpi_client import PagedResult, count_suppliers, search_suppliers
 
 logger = logging.getLogger(__name__)
 
@@ -398,7 +398,7 @@ class GetAllComputersInput(BaseModel):
         ge=1,
         le=500,
         description=(
-            "Jumlah komputer yang ditampilkan sebagai sample (default 50). "
+            # "Jumlah komputer yang ditampilkan sebagai sample (default 50). "
             "Nilai exact totalcount SELALU dikembalikan terlepas dari parameter ini."
         ),
     )
@@ -484,7 +484,7 @@ class GetComputerDetailTool(BaseTool):
 
 
 class CountAllComputersInput(BaseModel):
-    pass
+    call_id: str = Field(default="", exclude=True)
 
 
 class CountAllComputersTool(BaseTool):
@@ -495,6 +495,7 @@ class CountAllComputersTool(BaseTool):
         "Lebih cepat dari get_all_computers karena hanya mengambil count, bukan data."
     )
     args_schema: Type[BaseModel] = CountAllComputersInput
+    cache_function: Any = Field(default=lambda *args, **kwargs: False)
 
     def _run(self, **kwargs: Any) -> str:
         try:
@@ -952,9 +953,51 @@ class GetUserInfoTool(BaseTool):
             return f"Gagal mengambil profil user: {exc}"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+"""tools.py — Supplier Section Patch v5.1 (bugfix)
+
+Ganti SELURUH blok "# Categories & Suppliers" (baris ~955) hingga akhir file
+dengan kode di bawah ini.
+
+Juga update baris import it_glpi_client (atas file):
+  Tambahkan: count_suppliers, search_suppliers
+  (PagedResult sudah diimport sebelumnya)
+
+==========================================================================
+RINGKASAN PERUBAHAN v5.1:
+
+1. SupplierSearchInput — field `limit` batas atas dinaikkan ke 500
+   dan ditambahkan le_note di description agar LLM tidak tebak-tebak batas.
+   Akar masalah sebelumnya: LLM mencoba limit=1000, validasi Pydantic gagal,
+   agent loop retry → boros iterasi dan jawaban tidak akurat.
+
+2. CountSuppliersTool — tool baru `count_suppliers`
+   Menjawab "ada berapa supplier?" dengan 1 API call cepat. Tanpa tool ini,
+   agent terpaksa fetch semua data hanya untuk mendapat angka total.
+
+3. SearchSuppliersTool._run() — signature diubah ke **kwargs untuk robustness
+   Mencegah error jika LLM mengirim field tambahan yang tidak dikenal.
+
+4. _render_supplier_result() — tidak berubah (sudah benar di v5.0).
+
+5. it_support.py routing note — CountSuppliersTool perlu didaftarkan di
+   build_it_support() (lihat catatan di bawah).
+==========================================================================
+
+CATATAN UNTUK it_support.py:
+  Tambahkan import:
+    from app.tools import tool_count_suppliers
+
+  Tambahkan ke list tools di build_it_support():
+    tool_count_suppliers,
+
+CATATAN UNTUK crew_services.py:
+  Tambahkan baris ini di tool routing table (poin 2):
+    • Jumlah/total supplier (HANYA COUNT)  → count_suppliers
+"""
+
+# ════════════════════════════════════════════════════════════════════════════
 # Categories & Suppliers
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 class GetCategoriesInput(BaseModel):
     limit: int = Field(default=20, ge=1, le=100, description="Jumlah maksimal.")
@@ -972,44 +1015,219 @@ class GetCategoriesTool(BaseTool):
                 return "Tidak ada kategori ITIL ditemukan."
             output = f"Daftar kategori ITIL ({len(results)} item):\n\n"
             for cat in results:
-                cid         = cat.get("id") or cat.get("1") or "-"
-                name        = cat.get("name") or cat.get("2") or "-"
+                cid          = cat.get("id") or cat.get("1") or "-"
+                name         = cat.get("name") or cat.get("2") or "-"
                 completename = cat.get("completename") or cat.get("16") or ""
-                display     = completename if completename and completename != name else name
+                display      = completename if completename and completename != name else name
                 output += f"• (ID: {cid}) {display}\n"
             return output
         except Exception as exc:
             return f"Gagal mengambil kategori ITIL: {exc}"
 
 
-class GetSuppliersInput(BaseModel):
-    limit: int = Field(default=20, ge=1, le=100, description="Jumlah maksimal.")
+# ── Supplier Formatter ─────────────────────────────────────────────────────
+
+def _fmt_supplier_row(idx: int, supplier: dict[str, Any]) -> str:
+    """Format satu supplier menjadi blok teks ringkas dan informatif.
+
+    Menampilkan keenam kolom utama dasbor GLPI:
+    Name, Entity, Address (gabungan), Phone, Fax, Email.
+    """
+    def _val(key: str) -> str:
+        return str(supplier.get(key) or "").strip() or "(tidak ada)"
+
+    name = supplier.get("name") or "-"
+    sid  = supplier.get("id")
+    id_str = str(sid) if sid and str(sid) not in ("", "0") else "-"
+
+    return (
+        f"{idx}. {name} (ID: {id_str})\n"
+        f"   Entity  : {_val('entity')}\n"
+        f"   Alamat  : {_val('address')}\n"
+        f"   Telepon : {_val('phone')}\n"
+        f"   Fax     : {_val('fax')}\n"
+        f"   Email   : {_val('email')}\n"
+    )
 
 
-class GetSuppliersTool(BaseTool):
-    name: str = "get_suppliers"
-    description: str = "Ambil daftar supplier/vendor yang terdaftar di GLPI."
-    args_schema: Type[BaseModel] = GetSuppliersInput
+def _render_supplier_result(
+    result: "PagedResult",
+    filter_label: str = "",
+) -> str:
+    """Render PagedResult supplier menjadi string LLM-friendly."""
+    items      = result["items"]
+    totalcount = result["totalcount"]
+    fetched    = result["fetched"]
+    truncated  = result["truncated"]
 
-    def _run(self, limit: int = 20) -> str:
+    if not items and totalcount == 0:
+        filter_note = f" {filter_label}" if filter_label else ""
+        return f"Tidak ada supplier ditemukan{filter_note}."
+
+    total_fmt  = f"{totalcount:,}".replace(",", ".")
+    filter_str = f" {filter_label}" if filter_label else ""
+
+    if not truncated:
+        header = f"✅ Ditemukan {total_fmt} supplier{filter_str}.\n\n"
+    else:
+        sample_fmt = f"{fetched:,}".replace(",", ".")
+        header = (
+            f"✅ Total: **{total_fmt} supplier** ditemukan{filter_str}.\n"
+            f"⚠️  Menampilkan {sample_fmt} data pertama. "
+            f"Gunakan filter lebih spesifik untuk mempersempit hasil.\n\n"
+        )
+
+    rows = "".join(
+        _fmt_supplier_row(idx, s) + "\n"
+        for idx, s in enumerate(items, 1)
+    )
+
+    footer = ""
+    if truncated:
+        remaining     = totalcount - fetched
+        remaining_fmt = f"{remaining:,}".replace(",", ".")
+        footer = (
+            f"\n📌 ... dan {remaining_fmt} supplier lainnya tidak ditampilkan. "
+            f"Gunakan filter (name/entity/address/phone/fax/email) untuk mempersempit pencarian.\n"
+        )
+
+    return header + rows + footer
+
+
+# ── CountSuppliersTool ─────────────────────────────────────────────────────
+
+class CountSuppliersInput(BaseModel):
+    """Input schema untuk CountSuppliersTool — tidak ada parameter."""
+    call_id: str = Field(default="", exclude=True)
+
+
+class CountSuppliersTool(BaseTool):
+    """Hitung jumlah total supplier di GLPI (cepat, 1 API call)."""
+
+    name: str = "count_suppliers"
+    description: str = (
+        "Hitung jumlah TOTAL supplier/vendor yang terdaftar di GLPI. "
+        "Sangat cepat (1 API call). "
+        "Gunakan HANYA saat user bertanya 'ada berapa supplier', "
+        "'total vendor', atau pertanyaan count supplier tanpa filter. "
+        "Untuk list atau cari supplier, gunakan get_suppliers."
+    )
+    args_schema: Type[BaseModel] = CountSuppliersInput
+    cahce_function: Any = Field(default=lambda *args, **kwargs: False)
+
+    def _run(self, **kwargs: Any) -> str:
         try:
-            results = _run_async(it_glpi_client.fetch_suppliers(limit=limit))
-            if not results:
-                return "Tidak ada supplier/vendor ditemukan di GLPI."
-
-            output = f"Daftar supplier/vendor ({len(results)} item):\n\n"
-            for s in results:
-                sid  = s.get("id") or "-"
-                name = s.get("name") or "-"
-                output += f"• {name} (ID: {sid})\n"
-            return output
+            total: int = _run_async(it_glpi_client.count_suppliers())
+            total_fmt  = f"{total:,}".replace(",", ".")
+            logger.info("CountSuppliersTool: total=%d", total)
+            return f"Total supplier terdaftar di GLPI: **{total_fmt}** supplier."
         except Exception as exc:
-            return f"Gagal mengambil supplier: {exc}"
+            logger.error("CountSuppliersTool failed: %s", exc)
+            return f"Gagal menghitung jumlah supplier: {exc}"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ── SupplierSearchInput ────────────────────────────────────────────────────
+
+class SupplierSearchInput(BaseModel):
+    """Input schema untuk SearchSuppliersTool.
+
+    Semua parameter filter bersifat opsional.
+    Kosongkan semua filter untuk menampilkan semua supplier.
+
+    Batas limit: 1–500. Default: 50.
+    Jika ingin mengetahui JUMLAH TOTAL supplier saja (tanpa list),
+    gunakan tool count_suppliers — lebih cepat dan tidak butuh limit besar.
+    """
+    name:    Optional[str] = Field(default=None, description="Filter nama supplier (partial match).")
+    entity:  Optional[str] = Field(default=None, description="Filter entity/organisasi GLPI.")
+    address: Optional[str] = Field(default=None, description="Filter alamat (kota, jalan, dll).")
+    phone:   Optional[str] = Field(default=None, description="Filter nomor telepon.")
+    fax:     Optional[str] = Field(default=None, description="Filter nomor fax.")
+    email:   Optional[str] = Field(default=None, description="Filter alamat email.")
+    limit:   int           = Field(
+        default=50,
+        ge=1,
+        le=500,
+        description=(
+            "Jumlah maksimal hasil (1–500, default 50). "
+            "JANGAN set limit besar hanya untuk count — gunakan count_suppliers."
+        ),
+    )
+
+
+# ── SearchSuppliersTool ────────────────────────────────────────────────────
+
+class SearchSuppliersTool(BaseTool):
+    """Cari supplier/vendor di GLPI dengan filter dinamis.
+
+    Mendukung pencarian berdasarkan 6 kolom utama dasbor GLPI:
+    Name, Entity, Address, Phone, Fax, Email.
+    """
+
+    name: str = "get_suppliers"
+    description: str = (
+        "Cari dan tampilkan daftar supplier/vendor yang terdaftar di GLPI. "
+        "Mendukung filter opsional berdasarkan: "
+        "name (nama supplier), entity (entity GLPI), address (alamat/kota), "
+        "phone (nomor telepon), fax (nomor fax), email (alamat email). "
+        "Semua filter bersifat opsional — jika tidak diisi, semua supplier ditampilkan. "
+        "Output menampilkan: Nama, Entity, Alamat, Telepon, Fax, Email. "
+        "Untuk HANYA menghitung jumlah total supplier, gunakan count_suppliers (lebih cepat)."
+    )
+    args_schema: Type[BaseModel] = SupplierSearchInput
+
+    def _run(
+        self,
+        name:    Optional[str] = None,
+        entity:  Optional[str] = None,
+        address: Optional[str] = None,
+        phone:   Optional[str] = None,
+        fax:     Optional[str] = None,
+        email:   Optional[str] = None,
+        limit:   int           = 50,
+    ) -> str:
+        # Bangun label filter untuk output yang informatif
+        active_filters: list[str] = []
+        if name:    active_filters.append(f"nama='{name}'")
+        if entity:  active_filters.append(f"entity='{entity}'")
+        if address: active_filters.append(f"alamat='{address}'")
+        if phone:   active_filters.append(f"telepon='{phone}'")
+        if fax:     active_filters.append(f"fax='{fax}'")
+        if email:   active_filters.append(f"email='{email}'")
+
+        filter_label = (
+            f"dengan filter {', '.join(active_filters)}"
+            if active_filters else ""
+        )
+
+        logger.info(
+            "Tool SearchSuppliers | filters=%s | limit=%d",
+            active_filters, limit,
+        )
+
+        try:
+            result: "PagedResult" = _run_async(
+                it_glpi_client.search_suppliers(
+                    name=name,
+                    entity=entity,
+                    address=address,
+                    phone=phone,
+                    fax=fax,
+                    email=email,
+                    limit=limit,
+                ),
+                timeout=90.0,
+            )
+            return _render_supplier_result(result, filter_label=filter_label)
+
+        except Exception as exc:
+            logger.error("SearchSuppliersTool failed: %s", exc, exc_info=True)
+            return f"Gagal mengambil data supplier: {exc}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Instantiated tools — import these in it_support.py
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 tool_search_kb                 = SearchKnowledgeBaseTool()
 tool_get_assets                = GetUserAssetsTool()
@@ -1022,7 +1240,8 @@ tool_list_search_options       = ListSearchOptionsTool()
 tool_get_tickets               = GetTicketsTool()
 tool_get_user_info             = GetUserInfoTool()
 tool_get_categories            = GetCategoriesTool()
-tool_get_suppliers             = GetSuppliersTool()
+tool_get_suppliers             = SearchSuppliersTool()   # ← SearchSuppliersTool (bukan GetSuppliersTool)
+tool_count_suppliers           = CountSuppliersTool()    # ← BARU
 tool_count_all_computers       = CountAllComputersTool()
 tool_search_computer_by_name   = SearchComputerByNameTool()
 tool_search_computer           = SearchComputerTool()

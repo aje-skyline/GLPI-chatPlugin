@@ -26,6 +26,13 @@ from app import it_glpi_client
 
 logger = logging.getLogger(__name__)
 
+# ── Configure application logging ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
 # ── In-memory session store ───────────────────────────────────────────────────
 _user_sessions: dict[str, int] = {}
 _session_last_seen: dict[str, float] = {}

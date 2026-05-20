@@ -1,7 +1,11 @@
-"""Shared utilities for GLPI AI Gateway.
+"""Shared utilities — GLPI AI Gateway.
 
-Single source of truth for agent-output sanitization so that crew_services.py
-and main.py use identical logic and the function is only maintained in one place.
+Single source of truth untuk sanitasi output agent. Diimpor oleh
+crew_services.py agar logika tidak terduplikasi.
+
+Meskipun CrewAI native LLM menangani tool calling via JSON secara internal,
+agent ReAct masih bisa bocor format "Thought:/Action:" ke Final Answer
+(terbukti dari log produksi). Sanitizer ini adalah safety net terakhir.
 """
 
 import logging
@@ -9,61 +13,58 @@ import re
 
 logger = logging.getLogger(__name__)
 
-# ── Agent output sanitizer ────────────────────────────────────────────────────
-
-_AGENT_LINE_PATTERN = re.compile(
-    r"^\s*(Thought|Action\s+Input|Action|Observation|I need to|I will|I should|"
-    r"Let me|I'll|First,?\s+I|Now\s+I)\s*[:\-]",
+# ── Pola baris yang bocor dari format internal agent ─────────────────────────
+_AGENT_LEAK_PATTERN = re.compile(
+    r"^\s*("
+    r"Thought|Action\s+Input|Action|Observation"
+    r"|I need to|I will|I should"
+    r"|Let me|I'll|First,?\s+I|Now\s+I"
+    r")\s*[:\-]",
     re.IGNORECASE,
 )
 
 
 def sanitize_agent_output(raw: str) -> str:
-    """Remove leaked internal agent format (Thought/Action/Observation) from text.
+    """Bersihkan format internal agent dari output CrewAI.
 
-    Single canonical implementation — imported by both ``crew_services`` and
-    ``main`` so the logic never diverges between the two call-sites.
-
-    Strategy (applied in order):
-      1. If ``Final Answer:`` present → take only text after it.
-      2. Drop all lines starting with internal agent keywords; also drop
-         every subsequent line until the next blank line (entire "block").
+    Strategi (diterapkan berurutan):
+      1. Jika ada ``Final Answer:`` → ambil hanya teks setelahnya.
+      2. Drop semua baris yang dimulai dengan keyword internal agent
+         beserta seluruh "blok" berikutnya (hingga baris kosong berikutnya).
       3. Strip whitespace.
-      4. If result is empty → log a warning and return ``raw`` (better to
-         show a dirty answer than no answer at all).
+      4. Jika hasil kosong → log warning dan kembalikan ``raw`` apa adanya
+         (lebih baik jawaban kotor daripada tidak ada jawaban).
 
     Args:
-        raw: Raw string from ``crew.kickoff()`` or any agent output.
+        raw: String mentah dari ``crew.kickoff()`` atau output agent manapun.
 
     Returns:
-        Clean string ready to display to the user.
+        String bersih siap ditampilkan ke user.
     """
     if not raw:
         return raw
 
     text = raw.strip()
 
-    # Strategy 1: take after 'Final Answer:' (case-insensitive)
+    # Strategi 1: ambil setelah "Final Answer:"
     fa_match = re.search(r"(?i)final\s+answer\s*:", text)
     if fa_match:
         text = text[fa_match.end():].strip()
 
-    # Strategy 2: drop lines starting with internal agent keywords and the
-    # rest of their "block" (everything until the next blank line).
-    lines = text.splitlines()
+    # Strategi 2: drop baris keyword dan satu blok setelahnya
     clean_lines: list[str] = []
-    skip_until_blank = False
+    skip_block = False
 
-    for line in lines:
+    for line in text.splitlines():
         stripped = line.strip()
 
-        if skip_until_blank:
+        if skip_block:
             if stripped == "":
-                skip_until_blank = False
+                skip_block = False
             continue
 
-        if _AGENT_LINE_PATTERN.match(stripped):
-            skip_until_blank = True
+        if _AGENT_LEAK_PATTERN.match(stripped):
+            skip_block = True
             continue
 
         clean_lines.append(line)
@@ -71,7 +72,7 @@ def sanitize_agent_output(raw: str) -> str:
     cleaned = "\n".join(clean_lines).strip()
 
     if not cleaned:
-        logger.warning("sanitize_agent_output: cleaned output is empty, returning raw")
+        logger.warning("sanitize_agent_output: hasil bersih kosong, mengembalikan raw")
         return raw.strip()
 
     return cleaned

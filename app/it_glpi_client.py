@@ -1162,39 +1162,343 @@ async def fetch_itil_categories(limit: int = 20) -> list[dict[str, Any]]:
         return []
 
 
+"""GLPI REST API — Supplier section patch (v5.1 bugfix).
+
+Ganti SELURUH blok "# ── Suppliers" di it_glpi_client.py (baris ~1165 s.d. akhir file)
+dengan kode di bawah ini.
+
+==========================================================================
+RINGKASAN PERBAIKAN v5.1:
+
+1. FIELD ID MAPPING DIKOREKSI
+   ---------------------------
+   Versi sebelumnya memetakan field ID Supplier secara spekulatif dan hasilnya
+   salah (nomor telepon muncul di kolom Alamat, kota muncul di kolom Telepon,
+   dst). Strategi baru menggunakan pendekatan dua-fase:
+
+   Fase A — Endpoint GET /Supplier (expand_dropdowns=true)
+     Endpoint ini mengembalikan objek JSON dengan nama field yang eksplisit
+     (phonenumber, fax, email, address, postcode, town, state, country).
+     Ini digunakan untuk single-supplier lookup dan validasi field.
+
+   Fase B — Endpoint GET /search/Supplier
+     Digunakan untuk pencarian dengan filter (criteria). Field ID di sini
+     BERBEDA dari nama field di Fase A. Mapping yang benar untuk GLPI 10.x:
+       1  → name
+       4  → phonenumber  (KOREKSI: sebelumnya 11, sekarang 4)
+       5  → fax          (KOREKSI: sebelumnya 12, sekarang 5)
+       6  → email        (KOREKSI: sebelumnya 13, sekarang 6)
+       19 → address      (KOREKSI: sebelumnya 10, sekarang 19)
+       20 → postcode
+       21 → town
+       22 → state
+       23 → country
+       80 → entity       (tidak berubah)
+
+   ⚠️  CATATAN: Field ID Search API dapat berbeda di versi GLPI atau konfigurasi
+   plugin custom. Jalankan `list_search_options` dengan itemtype='Supplier'
+   untuk memverifikasi ID di instance Anda.
+
+2. STRATEGI HYBRID: SEARCH + ENRICH
+   ----------------------------------
+   search_suppliers() sekarang menggunakan strategi hybrid:
+   - Langkah 1: /search/Supplier → dapatkan daftar ID supplier yang cocok
+     dengan filter (ini cepat dan mendukung pagination/totalcount).
+   - Langkah 2: GET /Supplier/{id} → ambil detail lengkap per supplier
+     menggunakan field nama yang eksplisit (tidak bergantung pada field ID).
+   Ini menghilangkan ketergantungan pada field ID Search API yang tidak stabil,
+   sambil tetap mempertahankan kemampuan filter dan totalcount yang akurat.
+
+3. TAMBAH count_suppliers()
+   -------------------------
+   Fungsi baru yang hanya mengambil totalcount tanpa fetch semua data.
+   Analog dengan get_total_computers_count(). Digunakan oleh CountSuppliersTool
+   untuk menjawab pertanyaan "ada berapa supplier?" dengan cepat (1 API call).
+
+4. ID SUPPLIER SEKARANG AKURAT
+   ----------------------------
+   _parse_supplier_detail() mengambil `id` langsung dari endpoint /Supplier/{id}
+   yang selalu mengembalikan field `id` sebagai integer — tidak perlu fallback
+   ke key "2" seperti di Search API.
+==========================================================================
+"""
+
 # ── Suppliers ─────────────────────────────────────────────────────────────────
+#
+# Field ID untuk /search/Supplier (GLPI 10.x — verifikasi via /listSearchOptions/Supplier)
+# Digunakan HANYA untuk parameter criteria[] pada search request.
+# Untuk parsing hasil, kita fetch ulang via GET /Supplier/{id} agar field eksplisit.
+_SUPPLIER_FILTER_FIELD_IDS: dict[str, int] = {
+    "name":    1,    # name
+    "entity":  80,   # entities_id (konsisten di semua tipe GLPI)
+    "address": 19,   # address
+    "phone":   4,    # phonenumber
+    "fax":     5,    # fax
+    "email":   6,    # email
+}
+
+# forcedisplay minimal — kita hanya butuh field `id` (field 2) dari search response
+# agar bisa fetch detail via GET /Supplier/{id}.
+# Menambahkan `name` (field 1) sebagai fallback display jika enrich gagal.
+_SUPPLIER_SEARCH_MINIMAL_DISPLAY: dict[str, int] = {
+    "forcedisplay[0]": 2,   # id
+    "forcedisplay[1]": 1,   # name (fallback)
+}
+
+
+def _parse_supplier_detail(data: dict[str, Any]) -> dict[str, Any]:
+    """Parse response dari GET /Supplier/{id} ke format standar.
+
+    Menggunakan field nama eksplisit dari endpoint detail (bukan field ID
+    numerik dari Search API) — hasilnya selalu akurat terlepas dari versi GLPI.
+
+    GLPI menyimpan alamat dalam beberapa sub-field:
+      address  → jalan/gedung
+      postcode → kode pos
+      town     → kota
+      state    → provinsi
+      country  → negara
+    Fungsi ini menggabungkannya menjadi satu string `address` yang lengkap.
+
+    Args:
+        data: Raw dict dari GET /Supplier/{id}?expand_dropdowns=true.
+
+    Returns:
+        Dict standar: id, name, entity, address, phone, fax, email.
+    """
+    # Gabungkan komponen alamat menjadi satu string
+    addr_parts = [
+        data.get("address", ""),
+        data.get("postcode", ""),
+        data.get("town", ""),
+        data.get("state", ""),
+        data.get("country", ""),
+    ]
+    address = ", ".join(p.strip() for p in addr_parts if p and str(p).strip())
+
+    return {
+        "id":      data.get("id", ""),
+        "name":    data.get("name", "") or "",
+        "entity":  _clean_value(data.get("entities_id")),
+        "address": address or "",
+        "phone":   data.get("phonenumber", "") or "",
+        "fax":     data.get("fax", "") or "",
+        "email":   data.get("email", "") or "",
+    }
+
+
+async def _enrich_supplier_ids(
+    supplier_ids: list[int | str],
+) -> list[dict[str, Any]]:
+    """Fetch detail lengkap untuk setiap supplier ID secara concurrent.
+
+    Menggunakan GET /Supplier/{id}?expand_dropdowns=true agar field nama
+    (phonenumber, fax, email, address, town, dll) selalu eksplisit dan benar.
+
+    Args:
+        supplier_ids: List ID supplier integer.
+
+    Returns:
+        List dict supplier terparse, dengan item None yang difilter keluar.
+    """
+    async def _fetch_one(sid: int | str) -> dict[str, Any] | None:
+        try:
+            data = await _get(
+                f"/Supplier/{sid}",
+                params={"expand_dropdowns": "true"},
+            )
+            if isinstance(data, dict) and data.get("id"):
+                return _parse_supplier_detail(data)
+            return None
+        except Exception as exc:
+            logger.debug("_enrich_supplier_ids: failed for id=%s: %s", sid, exc)
+            return None
+
+    tasks = [_fetch_one(sid) for sid in supplier_ids]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    return [r for r in results if r is not None]
+
+
+async def count_suppliers() -> int:
+    """Hitung jumlah total supplier yang terdaftar di GLPI (exact count).
+
+    Hanya 1 API call — sangat cepat. Digunakan oleh CountSuppliersTool
+    untuk menjawab pertanyaan "ada berapa supplier?" tanpa fetch semua data.
+
+    Returns:
+        Integer jumlah total supplier, atau 0 jika gagal.
+    """
+    try:
+        data = await _get("/search/Supplier", params={
+            "range": "0-1",    # Minta minimal data — kita hanya butuh totalcount
+        })
+        if isinstance(data, dict):
+            return int(data.get("totalcount", 0))
+        return 0
+    except Exception as exc:
+        logger.warning("count_suppliers failed: %s", exc)
+        return 0
+
+
+async def search_suppliers(
+    name:    str | None = None,
+    entity:  str | None = None,
+    address: str | None = None,
+    phone:   str | None = None,
+    fax:     str | None = None,
+    email:   str | None = None,
+    limit:   int = 50,
+) -> "PagedResult":
+    """Cari supplier di GLPI dengan filter dinamis.
+
+    Strategi hybrid dua-fase:
+    1. GET /search/Supplier dengan criteria[] → dapatkan list ID + totalcount exact.
+    2. GET /Supplier/{id} per supplier → enrich dengan field detail yang eksplisit.
+
+    Fase 2 menggunakan asyncio.gather() untuk concurrent requests — performanya
+    baik meski ada banyak supplier (misal 30 supplier = 30 concurrent requests).
+
+    Args:
+        name   : Filter nama supplier (partial match, contains).
+        entity : Filter entity GLPI (partial match, contains).
+        address: Filter alamat (partial match, contains).
+        phone  : Filter nomor telepon (partial match, contains).
+        fax    : Filter nomor fax (partial match, contains).
+        email  : Filter email (partial match, contains).
+        limit  : Jumlah maksimal hasil (default 50).
+
+    Returns:
+        PagedResult dengan items (list supplier detail), totalcount exact,
+        fetched, dan truncated flag.
+    """
+    # ── Fase 1: Bangun criteria params ────────────────────────────────────────
+    filter_map: list[tuple[str, str | None]] = [
+        ("name",    name),
+        ("entity",  entity),
+        ("address", address),
+        ("phone",   phone),
+        ("fax",     fax),
+        ("email",   email),
+    ]
+    active_filters = [
+        (field, str(val).strip())
+        for field, val in filter_map
+        if val and str(val).strip()
+    ]
+
+    base_params: dict[str, Any] = {
+        "expand_dropdowns": "true",
+        **_SUPPLIER_SEARCH_MINIMAL_DISPLAY,
+    }
+
+    for idx, (field_name, value) in enumerate(active_filters):
+        field_id = _SUPPLIER_FILTER_FIELD_IDS[field_name]
+        base_params[f"criteria[{idx}][field]"]      = field_id
+        base_params[f"criteria[{idx}][searchtype]"] = "contains"
+        base_params[f"criteria[{idx}][value]"]      = value
+        if idx > 0:
+            base_params[f"criteria[{idx}][link]"] = "AND"
+
+    logger.info(
+        "search_suppliers: filters=%s limit=%d",
+        [(n, v) for n, v in active_filters],
+        limit,
+    )
+
+    # ── Fase 1: GET /search/Supplier → ambil ID list + totalcount ─────────────
+    try:
+        # Minta sample_size = limit agar pagination minimal
+        search_params = {**base_params, "range": f"0-{min(limit, 50) - 1}"}
+        raw = await _get("/search/Supplier", params=search_params)
+    except Exception as exc:
+        logger.error("search_suppliers: search phase failed: %s", exc)
+        return PagedResult(items=[], totalcount=0, fetched=0, truncated=False)
+
+    totalcount: int = 0
+    if isinstance(raw, dict):
+        totalcount = int(raw.get("totalcount", 0))
+
+    raw_items = _extract_data(raw)
+    search_items = [item for item in raw_items if isinstance(item, dict)]
+
+    if not search_items:
+        return PagedResult(items=[], totalcount=totalcount, fetched=0, truncated=False)
+
+    # Extract supplier IDs dari search response
+    # Search API mengembalikan field "2" sebagai ID (sesuai forcedisplay[0]=2)
+    supplier_ids: list[int | str] = []
+    for item in search_items[:limit]:
+        sid = _first(item, "2", "id")
+        if sid and str(sid) not in ("", "0"):
+            try:
+                supplier_ids.append(int(sid))
+            except (ValueError, TypeError):
+                supplier_ids.append(sid)
+
+    if not supplier_ids:
+        # Fallback: jika ID tidak bisa diekstrak, gunakan parsing minimal dari search
+        fallback_items = [
+            {
+                "id":      _first(item, "2", "id") or "-",
+                "name":    _first(item, "1", "name") or "-",
+                "entity":  "",
+                "address": "",
+                "phone":   "",
+                "fax":     "",
+                "email":   "",
+            }
+            for item in search_items[:limit]
+        ]
+        return PagedResult(
+            items=fallback_items,
+            totalcount=totalcount or len(fallback_items),
+            fetched=len(fallback_items),
+            truncated=(totalcount > len(fallback_items)),
+        )
+
+    # ── Fase 2: Enrich via GET /Supplier/{id} → field eksplisit ──────────────
+    enriched = await _enrich_supplier_ids(supplier_ids)
+
+    fetched = len(enriched)
+    truncated = totalcount > fetched
+
+    logger.info(
+        "search_suppliers: DONE totalcount=%d enriched=%d truncated=%s",
+        totalcount, fetched, truncated,
+    )
+
+    return PagedResult(
+        items=enriched,
+        totalcount=totalcount or fetched,
+        fetched=fetched,
+        truncated=truncated,
+    )
+
 
 async def fetch_suppliers(limit: int = 20) -> list[dict[str, Any]]:
-    """Fetch daftar supplier/vendor dari GLPI."""
-    cache_key = f"suppliers:{limit}"
+    """Fetch daftar supplier/vendor (backward-compatible wrapper).
+
+    Untuk pencarian dengan filter, panggil search_suppliers() langsung.
+
+    Args:
+        limit: Jumlah maksimal supplier yang dikembalikan.
+
+    Returns:
+        List dict supplier dengan field: id, name, entity, address, phone, fax, email.
+    """
+    cache_key = f"suppliers_all:{limit}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached  # type: ignore[return-value]
 
     try:
-        data = await _get("/Supplier", params={
-            "expand_dropdowns": "true",
-            "range": f"0-{limit - 1}",
-        })
-        items: list[Any] = _extract_data(data)
-        result = [
-            {
-                "id": item.get("id", ""),
-                "name": item.get("name", ""),
-                "phonenumber": item.get("phonenumber", ""),
-                "website": item.get("website", ""),
-                "email": item.get("email", ""),
-                "comment": _strip_html(item.get("comment", "") or ""),
-            }
-            for item in items if isinstance(item, dict)
-        ]
-        _cache_set(cache_key, result)
-        return result
+        result = await search_suppliers(limit=limit)
+        items = result["items"]
+        _cache_set(cache_key, items)
+        return items
     except Exception as exc:
-        logger.warning("fetch_suppliers failed: %s", exc)
+        logger.warning("fetch_suppliers fallback failed: %s", exc)
         return []
-
-
 # ── Shared Search API constants ───────────────────────────────────────────────
 
 _COMPUTER_SEARCH_FORCEDISPLAY: dict[str, int] = {

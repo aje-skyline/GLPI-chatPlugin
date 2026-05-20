@@ -1,26 +1,18 @@
-"""CrewAI orchestration untuk GLPI AI Gateway.
+"""CrewAI orchestration — GLPI AI Gateway.
 
-Membuat dan menjalankan CrewAI crew dengan IT Support Agent untuk menangani
-query user tentang data GLPI.
+Satu-satunya tempat inisialisasi LLM (CrewAI native) dan eksekusi Crew.
+Semua konfigurasi LLM berasal dari `app.config.settings`.
 
-CHANGELOG v4.0 — Smart Pagination & Large Data Handling:
-  - Task description diperbarui: instruksi eksplisit tentang cara LLM harus
-    menafsirkan output tools yang berisi totalcount dan summary stats.
-  - Tambah seksi "INTERPRETASI DATA BESAR" di task: agent diarahkan untuk
-    menggunakan totalcount exact dari tool, bukan mencoba menghitung baris.
-  - _LARGE_DATA_GUIDANCE: konstanta terpisah agar mudah di-tune.
-  - Tidak ada perubahan di _format_history atau run_crew — logika bisnis sama.
-
-CHANGELOG v3.0:
-  - Task description: lebih ringkas, hindari ambiguitas.
-  - Tambah post-processing agresif via sanitize_agent_output.
+CHANGELOG:
+  v5.1 — Tambah _SUPPLIER_TOOL_GUIDANCE; routing count_suppliers.
+  v4.0 — Smart Pagination & Large Data Handling.
+  v3.0 — Task description ringkas; sanitize_agent_output post-processing.
 """
 
 import logging
-import re
 from typing import Any
 
-from crewai import Crew, LLM, Task, Process
+from crewai import Crew, LLM, Process, Task
 
 from app.agents import build_it_support
 from app.config import settings
@@ -28,67 +20,97 @@ from app.utils import sanitize_agent_output
 
 logger = logging.getLogger(__name__)
 
-# Jumlah pesan sebelumnya yang disertakan sebagai konteks.
-_HISTORY_WINDOW = 10  # 5 turns = 10 messages (user + assistant)
+# Jumlah pesan sebelumnya yang disertakan sebagai konteks (5 turns = 10 messages).
+_HISTORY_WINDOW: int = 10
 
-# ── Panduan interpretasi data besar — disuntikkan ke task description ─────────
-# Dipisah sebagai konstanta agar mudah di-tune tanpa mengubah logika utama.
-_LARGE_DATA_GUIDANCE: str = """\
-[PANDUAN INTERPRETASI HASIL TOOL — DATA BESAR]
 
-Tools inventaris komputer (get_all_computers, get_computers_by_*) sekarang
-mengembalikan output dalam format SMART PAGINATION:
-
-  ✅ Total: X.XXX komputer ditemukan di GLPI.
-  ⚠️  Data terlalu besar — menampilkan YY sampel pertama. ...
-  📊 Statistik Distribusi:
-     Status: ...
-     Lokasi: ...
-     OS: ...
-  [baris-baris data sampel]
-  📌 ... dan ZZZ item lainnya tidak ditampilkan.
-
-ATURAN WAJIB saat membaca output tools:
-1. Angka "Total: X.XXX" adalah JUMLAH EXACT dari database GLPI — gunakan angka
-   ini saat user bertanya "ada berapa" atau "jumlah total". JANGAN hitung baris.
-2. Jika ada flag ⚠️ (truncated), sampaikan ke user bahwa data yang ditampilkan
-   hanyalah SAMPLE — total sesungguhnya ada di baris "Total: ...".
-3. Statistik distribusi (📊) adalah ringkasan dari sample yang ada. Jika ada
-   flag truncated, sampaikan bahwa statistik berdasarkan sample, bukan keseluruhan.
-4. Untuk pertanyaan jumlah by filter (mis: "berapa komputer di Lantai 3"),
-   gunakan tool get_computers_by_location atau get_computers_by_status —
-   totalcount dari tool tersebut adalah jumlah exact untuk filter itu.
-5. JANGAN panggil get_all_computers hanya untuk mendapat jumlah total —
-   gunakan count_all_computers yang lebih cepat (1 API call, bukan paginasi).
-"""
-
+# ── LLM Factory ───────────────────────────────────────────────────────────────
 
 def _create_llm() -> LLM:
-    """Inisialisasi LLM untuk CrewAI menggunakan LiteLLM wrapper."""
+    """Inisialisasi CrewAI LLM native untuk AI Gateway kustom.
+
+    Menggunakan prefix "openai/" pada nama model karena AI Gateway
+    yang dipakai kompatibel dengan OpenAI API spec. CrewAI meneruskan
+    prefix ini ke LiteLLM internal-nya untuk pemilihan provider yang tepat.
+
+    Tidak ada import `litellm` atau `langchain` di sini — semuanya
+    ditangani oleh CrewAI secara internal.
+
+    Returns:
+        Instance `crewai.LLM` yang siap digunakan oleh Agent.
+    """
     return LLM(
-        model=f"openai/{settings.ai_model}",
+        model=f"openai/{settings.ai_model}",   # prefix "openai/" = OpenAI-compatible gateway
         api_key=settings.ai_gateway_api_key,
         api_base=settings.resolved_ai_gateway_base_url,
         temperature=1,
     )
 
 
-def _format_history(messages: list[dict[str, str]], current_message: str) -> str:
-    """Format turn percakapan sebelumnya menjadi blok konteks yang dapat dibaca.
+# ── Task Guidance Strings ─────────────────────────────────────────────────────
 
-    Mengecualikan pesan user terakhir (pertanyaan saat ini) berdasarkan index.
+_LARGE_DATA_GUIDANCE: str = """\
+[PANDUAN INTERPRETASI HASIL TOOL — DATA BESAR]
+
+Tools inventaris komputer (get_all_computers, get_computers_by_*) mengembalikan
+output dalam format SMART PAGINATION:
+
+  ✅ Total: X.XXX komputer ditemukan di GLPI.
+  ⚠️  Data terlalu besar — menampilkan YY sampel pertama.
+  📊 Statistik Distribusi: Status / Lokasi / OS
+  [baris-baris data sampel]
+  📌 ... dan ZZZ item lainnya tidak ditampilkan.
+
+ATURAN WAJIB:
+1. "Total: X.XXX" = JUMLAH EXACT dari database — gunakan ini untuk pertanyaan count.
+2. Flag ⚠️ = data ditampilkan hanyalah SAMPLE — sampaikan ke user.
+3. Untuk count by filter → get_computers_by_location / get_computers_by_status.
+4. JANGAN panggil get_all_computers hanya untuk count → gunakan count_all_computers.
+"""
+
+_SUPPLIER_TOOL_GUIDANCE: str = """\
+[PANDUAN PENGGUNAAN TOOL SUPPLIER]
+
+Tersedia DUA tool supplier — pilih yang tepat:
+
+  A) count_suppliers  → HANYA menghitung jumlah total (1 API call, cepat)
+     Gunakan untuk: "ada berapa supplier?", "total vendor?", pertanyaan COUNT.
+     JANGAN gunakan get_suppliers(limit=besar) hanya untuk count.
+
+  B) get_suppliers    → List/cari supplier dengan detail lengkap
+     Parameter filter (semua opsional, dikombinasi AND):
+       name / entity / address / phone / fax / email / limit (default 50, maks 500)
+
+PEMETAAN INTENT → TOOL:
+  "ada berapa total supplier?"           → count_suppliers()
+  "berikan detail supplier SYNNEX"       → get_suppliers(name="SYNNEX")
+  "supplier yang alamatnya di Jakarta"   → get_suppliers(address="Jakarta")
+  "daftar semua supplier"                → get_suppliers()
+
+ATURAN:
+1. COUNT → count_suppliers. JANGAN get_suppliers dengan limit besar.
+2. DETAIL/LIST → get_suppliers dengan filter relevan.
+3. limit > 50 hanya jika user eksplisit meminta semua data.
+"""
+
+
+# ── History Formatter ─────────────────────────────────────────────────────────
+
+def _format_history(messages: list[dict[str, str]], current_message: str) -> str:
+    """Format riwayat percakapan sebelumnya menjadi blok konteks terbaca.
+
+    Mengecualikan pesan user terakhir (pertanyaan saat ini).
 
     Args:
-        messages       : Array pesan lengkap (termasuk turn saat ini).
-        current_message: Teks pesan user terbaru (digunakan hanya sebagai label).
+        messages       : Array pesan lengkap termasuk turn saat ini.
+        current_message: Teks pesan user terbaru (hanya untuk referensi log).
 
     Returns:
-        String turn sebelumnya yang terformat, atau empty string jika tidak ada.
+        String riwayat terformat, atau string kosong jika tidak ada.
     """
     if not messages:
         return ""
 
-    # Cari index pesan user terakhir (pertanyaan saat ini).
     last_user_idx: int = -1
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "user":
@@ -115,54 +137,36 @@ def _format_history(messages: list[dict[str, str]], current_message: str) -> str
     return "\n".join(lines)
 
 
-def run_crew(
+# ── Task Description Builder ──────────────────────────────────────────────────
+
+def _build_task_description(
     user_message: str,
     glpi_user_id: int,
-    messages: list[dict[str, str]] | None = None,
+    all_messages: list[dict[str, str]],
 ) -> str:
-    """Jalankan CrewAI crew untuk memproses query user tentang data GLPI.
+    """Bangun task description lengkap untuk satu request."""
+    history_text = _format_history(all_messages, user_message)
 
-    Args:
-        user_message  : Query user terbaru.
-        glpi_user_id  : GLPI User ID (0 untuk query umum tanpa konteks user).
-        messages      : Riwayat percakapan lengkap (termasuk turn saat ini).
-
-    Returns:
-        Jawaban akhir dari agent (sudah dipost-process).
-
-    Note:
-        Ini adalah blocking call — gunakan run_in_executor saat dipanggil
-        dari konteks async.
-    """
-    llm: LLM = _create_llm()
-    agent: Any = build_it_support(llm, glpi_user_id=glpi_user_id)
-
-    all_messages = messages or []
-    history_text: str = _format_history(all_messages, user_message)
-
-    # ── Blok 1: Konteks sesi ──────────────────────────────────────────────────
-    user_context_block = (
-        "[KONTEKS SESI]\n"
-        f"• GLPI User ID aktif : "
-        f"{glpi_user_id if glpi_user_id > 0 else '(belum diketahui — jangan gunakan user_id=0 untuk query personal)'}\n"
-        f"• Jumlah pesan dalam riwayat: {len(all_messages)}\n\n"
-    )
-
-    # ── Blok 2: Riwayat percakapan ────────────────────────────────────────────
-    history_block: str = (
-        f"[RIWAYAT PERCAKAPAN SEBELUMNYA]\n{history_text}\n\n"
-        if history_text
-        else ""
-    )
-
-    # ── Blok 3: Tool routing berdasarkan user_id ──────────────────────────────
-    uid_note = (
+    uid_label = (
         f"user_id={glpi_user_id}"
         if glpi_user_id > 0
         else "user_id=UNKNOWN (jangan panggil tool personal tanpa ID yang valid)"
     )
 
-    task_description = f"""\
+    user_context_block = (
+        "[KONTEKS SESI]\n"
+        f"• GLPI User ID aktif : "
+        f"{glpi_user_id if glpi_user_id > 0 else '(belum diketahui)'}\n"
+        f"• Jumlah pesan dalam riwayat: {len(all_messages)}\n\n"
+    )
+
+    history_block = (
+        f"[RIWAYAT PERCAKAPAN SEBELUMNYA]\n{history_text}\n\n"
+        if history_text
+        else ""
+    )
+
+    return f"""\
 {user_context_block}{history_block}\
 [PERTANYAAN TERBARU DARI USER]
 "{user_message}"
@@ -170,46 +174,72 @@ def run_crew(
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PANDUAN PENGERJAAN:
 
-1. Periksa riwayat percakapan di atas. Jika data yang diperlukan SUDAH ADA
-   dan user hanya merujuk data itu (mis. "komputer tadi", "tiket itu"),
-   JANGAN panggil tool lagi — gunakan data dari riwayat.
+1. Periksa riwayat di atas. Jika data sudah ada dan user merujuknya
+   ("komputer tadi", "tiket itu") → JANGAN panggil tool lagi.
 
-2. Jika data BELUM ADA atau user meminta data baru, panggil tool yang sesuai:
-   • Jumlah/total komputer (HANYA COUNT)  → count_all_computers
-   • Panduan/KB                           → search_knowledge_base
-   • Semua komputer + total + statistik   → get_all_computers
-   • Cari komputer (nama/serial/inv)      → search_computer
-   • Komputer by lokasi + total           → get_computers_by_location
-   • Komputer by status + total           → get_computers_by_status
-   • Komputer by OS + total               → get_computers_by_os
-   • Aset milik user                      → get_user_assets ({uid_note})
-   • Detail komputer by ID                → get_computer_detail
-   • Tiket user                           → get_user_tickets ({uid_note})
-   • Profil user                          → get_user_info ({uid_note})
-   • Kontrak                              → list_all_contracts
-   • Detail kontrak by ID                 → get_contract_detail
-   • Supplier                             → get_suppliers
-   • Kategori ITIL                        → get_itil_categories
+2. Jika data belum ada, pilih tool yang sesuai:
+   • Jumlah/total komputer      → count_all_computers
+   • Jumlah/total supplier      → count_suppliers
+   • Panduan/KB                 → search_knowledge_base
+   • Semua komputer + statistik → get_all_computers
+   • Cari komputer              → search_computer
+   • Komputer by lokasi         → get_computers_by_location
+   • Komputer by status         → get_computers_by_status
+   • Komputer by OS             → get_computers_by_os
+   • Aset milik user            → get_user_assets ({uid_label})
+   • Detail komputer by ID      → get_computer_detail
+   • Tiket user                 → get_user_tickets ({uid_label})
+   • Profil user                → get_user_info ({uid_label})
+   • Kontrak                    → list_all_contracts
+   • Detail kontrak by ID       → get_contract_detail
+   • Supplier list/detail/cari  → get_suppliers  (lihat panduan bawah)
+   • Kategori ITIL              → get_itil_categories
 
-3. WAJIB: Semua tool yang butuh user_id → gunakan {uid_note}.
+3. WAJIB: Semua tool yang butuh user_id → gunakan {uid_label}.
 
 {_LARGE_DATA_GUIDANCE}
 
+{_SUPPLIER_TOOL_GUIDANCE}
+
 4. Tulis Final Answer dalam Bahasa Indonesia yang sopan dan natural.
    JANGAN tampilkan JSON, "Action:", "Thought:", atau format internal apapun.
-   Saat menyebut jumlah komputer, gunakan angka dari "Total:" di output tool —
-   JANGAN menghitung baris atau menebak-nebak.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\
-"""
+   Gunakan angka dari output tool — JANGAN tebak-tebak.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def run_crew(
+    user_message: str,
+    glpi_user_id: int,
+    messages: list[dict[str, str]] | None = None,
+) -> str:
+    """Jalankan CrewAI Crew untuk memproses satu query user GLPI.
+
+    Ini adalah blocking call — panggil via `loop.run_in_executor` dari
+    konteks async (sudah dilakukan di main.py).
+
+    Args:
+        user_message  : Query user terbaru.
+        glpi_user_id  : GLPI User ID (0 untuk query umum).
+        messages      : Riwayat percakapan lengkap termasuk turn saat ini.
+
+    Returns:
+        Jawaban final yang sudah di-sanitize, siap ditampilkan ke user.
+    """
+    all_messages: list[dict[str, str]] = messages or []
+
+    # LLM dibuat fresh per request agar tidak ada state tersisa antar sesi.
+    llm: LLM = _create_llm()
+    agent: Any = build_it_support(llm, glpi_user_id=glpi_user_id)
 
     task: Task = Task(
-        description=task_description,
+        description=_build_task_description(user_message, glpi_user_id, all_messages),
         expected_output=(
             "Jawaban akhir dalam Bahasa Indonesia yang sopan, akurat berdasarkan "
             "data dari tool, tanpa format internal seperti Thought/Action/JSON. "
-            "Untuk data inventaris besar: sebutkan jumlah exact dari totalcount tool, "
-            "rangkum statistik distribusi jika tersedia, dan berikan beberapa contoh "
-            "item sebagai ilustrasi — tidak perlu sebutkan semua baris."
+            "Untuk inventaris besar: sebutkan jumlah exact dari totalcount tool. "
+            "Untuk supplier: tampilkan Name, Entity, Alamat, Telepon, Fax, Email."
         ),
         agent=agent,
     )
@@ -218,26 +248,25 @@ PANDUAN PENGERJAAN:
         agents=[agent],
         tasks=[task],
         process=Process.sequential,
-        verbose=True,
+        verbose=settings.crew_verbose,
     )
 
-    prior_turns = len([m for m in all_messages if m.get("role") == "user"])
+    prior_turns = max(0, len([m for m in all_messages if m.get("role") == "user"]) - 1)
     logger.info(
-        "Crew kickoff | user_id=%s | prior_turns=%d | msg='%s...'",
+        "Crew kickoff | user_id=%s | prior_turns=%d | msg='%.80s'",
         glpi_user_id,
-        max(0, prior_turns - 1),
-        user_message[:80],
+        prior_turns,
+        user_message,
     )
 
     try:
         result: Any = crew.kickoff()
-        raw_str = str(result)
-        clean_str = sanitize_agent_output(raw_str)
+        clean_str = sanitize_agent_output(str(result))
 
         logger.info(
-            "Crew done | user_id=%s | result='%s...'",
+            "Crew done | user_id=%s | result='%.120s'",
             glpi_user_id,
-            clean_str[:120],
+            clean_str,
         )
         return clean_str
 

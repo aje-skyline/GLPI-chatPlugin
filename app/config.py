@@ -1,71 +1,80 @@
-"""Application configuration using Pydantic Settings.
+"""Application configuration — GLPI AI Gateway.
 
-Reads from .env file and environment variables.
+Membaca konfigurasi dari file .env dan environment variables
+menggunakan Pydantic Settings.
+
+Semua field LLM merujuk ke AI Gateway kustom yang kompatibel dengan
+OpenAI API spec. Tidak ada konfigurasi LiteLLM atau LangChain di sini
+— CrewAI menangani pemetaan provider secara internal via prefix "openai/".
 """
 
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    """Centralized settings for GLPI AI Gateway.
+    """Konfigurasi terpusat GLPI AI Gateway.
 
     Attributes:
-        ai_gateway_url: Full URL for AI Gateway (e.g., https://ai-gw/v1/chat/completions)
-        ai_gateway_base_url: Base URL without endpoint suffix (optional, auto-resolved)
-        ai_gateway_api_key: API key for authenticating to AI Gateway
-        nemotron_model: Model name for CrewAI via LiteLLM (prefix with "openai/")
-        gateway_api_key: Bearer token for this FastAPI service
-        allowed_origins: CORS allowed origins (comma-separated)
-        glpi_url: Base URL for GLPI instance
-        glpi_app_token: GLPI application token
-        glpi_user_token: GLPI user token for session init
+        mock_mode             : Jika True, skip panggilan GLPI/LLM (untuk testing).
+        crew_verbose          : Aktifkan logging verbose CrewAI.
+        ai_gateway_url        : URL lengkap AI Gateway (mis. https://ai-gw/v1/chat/completions).
+        ai_gateway_base_url   : Base URL tanpa suffix endpoint (opsional, auto-resolved).
+        ai_gateway_api_key    : API key untuk autentikasi ke AI Gateway.
+        ai_model              : Nama model (tanpa prefix provider, mis. "gpt-5-mini").
+        gateway_api_key       : Bearer token untuk mengamankan endpoint FastAPI ini.
+        allowed_origins       : CORS allowed origins (comma-separated).
+        glpi_url              : Base URL instance GLPI.
+        glpi_app_token        : GLPI application token.
+        glpi_user_token       : GLPI user token untuk inisialisasi sesi.
+        glpi_api_url          : URL lengkap GLPI REST API.
+        glpi_verify_ssl       : Verifikasi SSL certificate GLPI (set False untuk self-signed).
+        session_ttl_minutes   : Durasi session in-memory sebelum di-cleanup.
     """
 
-    # Konfigurasi utama
-    mock_mode: bool = False
+    # ── Runtime flags ──────────────────────────────────────────────────────────
+    mock_mode: bool    = False
     crew_verbose: bool = False
-    
-    #Provider Selection
-    llm_provider: str = "openai"
-    llm_model: str= "gpt-5-mini"
 
-    # AI Gateway (Nemotron)
+    # ── AI Gateway / LLM ───────────────────────────────────────────────────────
+    # Konfigurasi untuk AI Gateway kustom kompatibel OpenAI.
+    # Prefix provider ("openai/") ditambahkan di crew_services.py saat
+    # membuat instance crewai.LLM — tidak perlu disimpan di sini.
     ai_gateway_url: str
     ai_gateway_base_url: str = ""
     ai_gateway_api_key: str
-
-    # Model for CrewAI
     ai_model: str = "gpt-5-mini"
 
-    # FastAPI Gateway security
+    # ── FastAPI Gateway security ───────────────────────────────────────────────
     gateway_api_key: str
     allowed_origins: str = "http://172.16.14.141"
 
-    # GLPI API
-    glpi_url: str = "https://172.16.14.141"
+    # ── GLPI REST API ──────────────────────────────────────────────────────────
+    glpi_url: str       = "https://172.16.14.141"
     glpi_app_token: str = ""
     glpi_user_token: str = ""
-    glpi_api_url: str = "https://172.16.14.141/asset/apirest.php"
-
-    # SSL
+    glpi_api_url: str   = "https://172.16.14.141/asset/apirest.php"
     glpi_verify_ssl: bool = False
-    
-    # Session config
+
+    # ── Session store ──────────────────────────────────────────────────────────
     session_ttl_minutes: int = 60
 
     model_config = {"env_file": ".env"}
 
     @property
     def resolved_ai_gateway_base_url(self) -> str:
-        """Resolve base URL for AI Gateway.
+        """Resolve base URL untuk CrewAI LLM.
 
-        LiteLLM appends /chat/completions automatically, so we strip it if present.
-        Falls back to ai_gateway_url with suffix removed.
+        LiteLLM (internal CrewAI) menambahkan /chat/completions secara
+        otomatis, jadi suffix tersebut perlu di-strip jika ada.
+
+        Returns:
+            Base URL bersih tanpa trailing slash dan tanpa suffix endpoint.
         """
         if self.ai_gateway_base_url:
             return self.ai_gateway_base_url.rstrip("/")
+
         base = self.ai_gateway_url
-        for suffix in ["/v1/chat/completions", "/chat/completions"]:
+        for suffix in ("/v1/chat/completions", "/chat/completions"):
             if base.endswith(suffix):
                 return base[: -len(suffix)].rstrip("/")
         return base.rstrip("/")
