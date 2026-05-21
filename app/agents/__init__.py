@@ -4,6 +4,6 @@ Export agent builder functions for use in crew_services.
 See it_support.py for IT Support agent definition.
 """
 
-from app.agents.it_support import build_it_support
+from app.legacy.it_support import build_it_support
 
 __all__ = ["build_it_support"]

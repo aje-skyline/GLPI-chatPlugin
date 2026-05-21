@@ -97,7 +97,7 @@ def test_session_id_resolution():
 
 def test_user_info_name_priority():
     """Test fetch_user_info name priority logic."""
-    from app.it_glpi_client import fetch_user_info
+    from app.legacy.it_glpi_client import fetch_user_info
     import asyncio
     from unittest.mock import AsyncMock, patch
     

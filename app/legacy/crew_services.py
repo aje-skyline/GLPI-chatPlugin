@@ -177,16 +177,16 @@ A) count_suppliers  → HANYA menghitung jumlah total (1 API call, ~1 detik)
    Gunakan untuk: "ada berapa supplier?", "total vendor?", pertanyaan COUNT.
 B) get_suppliers    → List/cari supplier dengan detail lengkap
    Parameter filter (semua opsional, dikombinasi AND):
-   name / entity / address / phone / fax / email / limit (default 20, MAKS 20)
+   name / entity / address / phone / fax / email / limit (default 5, MAKS 20)
 
 ATURAN WAJIB UNTUK "DAFTAR SEMUA" / "TAMPILKAN SEMUA SUPPLIER":
-1. PANGGIL get_suppliers(limit=20) — SEKALI SAJA.
-2. Tool mengembalikan totalcount exact + sampel ≤ 5 baris.
+1. PANGGIL get_suppliers(limit=5) — SEKALI SAJA.
+2. Tool mengembalikan totalcount exact + sampel ≤ 5 baris TERBARU.
 3. Setelah tool mengembalikan output dengan [INSTRUKSI SISTEM — WAJIB DIIKUTI]:
    → TULIS Final Answer LANGSUNG. JANGAN panggil tool apapun lagi.
    → JANGAN coba limit lebih besar, offset berbeda, atau filter tambahan
      hanya untuk mendapatkan "sisa" data.
-4. Sampaikan ke user: "Terdapat X supplier terdaftar. Berikut contoh teratas.
+4. Sampaikan ke user: "Terdapat X supplier terdaftar. Berikut 5 data terbaru.
    Sebutkan nama/kota/email spesifik jika ingin mencari supplier tertentu."
 
 ⛔ LARANGAN KERAS: Memanggil get_suppliers lebih dari SATU KALI per pertanyaan
@@ -195,10 +195,10 @@ ATURAN WAJIB UNTUK "DAFTAR SEMUA" / "TAMPILKAN SEMUA SUPPLIER":
 
 PEMETAAN INTENT → TOOL:
 "ada berapa total supplier?"           → count_suppliers()
-"daftar semua supplier"                → get_suppliers(limit=20) — SEKALI SAJA
+"daftar semua supplier"                → get_suppliers(limit=5) — SEKALI SAJA
 "berikan detail supplier SYNNEX"       → get_suppliers(name="SYNNEX")
 "supplier yang alamatnya di Jakarta"   → get_suppliers(address="Jakarta")
-"berapa supplier + daftarnya"          → count_suppliers() LALU get_suppliers(limit=20)
+"berapa supplier + daftarnya"          → count_suppliers() LALU get_suppliers(limit=5)
 """
 
 

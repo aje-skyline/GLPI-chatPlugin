@@ -16,13 +16,17 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
 
+from contextlib import asynccontextmanager
+from app.infrastructure import close_http_client
+from app.cache import cache_clear # Menggantikan invalidate_static_cache yang lama
+
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.crew_services import run_crew, run_crew_async
-from app import it_glpi_client
+from app.services.crew_orchestrator import run_crew, run_crew_async
+from app.agents.prompt_builder import _compress_for_history
 
 logger = logging.getLogger(__name__)
 
@@ -154,13 +158,6 @@ def _compress_for_history(answer: str) -> str:
         + "\n… [ringkasan: jawaban asli lebih panjang. "
         + "Agent dapat memanggil tool kembali jika user butuh detail lengkap.]"
     )
-
-def _save_to_session(session_id: str, messages: list[dict[str, str]], answer: str) -> None:
-    """Simpan riwayat percakapan ke session, dengan kompresi untuk jawaban panjang."""
-    compressed = _compress_for_history(answer)
-    assistant_msg = {"role": "assistant", "content": compressed}
-    _session_messages[session_id] = (messages + [assistant_msg])[-_MAX_SESSION_MESSAGES:]
-    _session_last_seen[session_id] = time.time()
 
 def _save_to_session(session_id: str, messages: list[dict[str, str]], answer: str) -> None:
     """Simpan riwayat percakapan ke session."""
@@ -346,8 +343,10 @@ async def _lifespan(app: FastAPI):
     asyncio.create_task(_session_cleanup_loop())
     logger.info("GLPI AI Gateway started")
     yield
-    await it_glpi_client.close_http_client()
-    it_glpi_client.invalidate_static_cache()
+    # Tutup koneksi pool HTTP
+    await close_http_client()
+    # Bersihkan cache in-memory
+    cache_clear()
     logger.info("GLPI AI Gateway shutdown complete")
 
 

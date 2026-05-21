@@ -1463,6 +1463,8 @@ async def search_suppliers(
 
     base_params: dict[str, Any] = {
         "expand_dropdowns": "true",
+        "sort":             2,      # Sort by ID
+        "order":            "DESC", # Latest first
         **_SUPPLIER_SEARCH_MINIMAL_DISPLAY,
     }
 
@@ -1561,7 +1563,7 @@ async def search_suppliers(
     )
 
 
-async def fetch_suppliers(limit: int = 20) -> list[dict[str, Any]]:
+async def fetch_suppliers(limit: int = 5) -> list[dict[str, Any]]:
     """Fetch daftar supplier/vendor (backward-compatible wrapper).
 
     Untuk pencarian dengan filter, panggil search_suppliers() langsung.
