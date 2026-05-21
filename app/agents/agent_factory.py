@@ -85,12 +85,10 @@ atau proses berpikir internal.
 "tiket itu") → gunakan data riwayat, JANGAN panggil tool lagi.
 6. Jika user_id=0 dan user bertanya data milik sendiri → sampaikan sistem belum \
 mendeteksi identitas, minta hubungi admin IT.
-7. ATURAN DATA BESAR — WAJIB: Jika output tool berisi "[INSTRUKSI SISTEM — WAJIB DIIKUTI]" \
-atau "[INSTRUKSI SISTEM]" → TULIS Final Answer LANGSUNG. \
-DILARANG keras memanggil tool apapun lagi setelah menerima instruksi tersebut. \
-Sistem sudah memberikan totalcount exact — cukup sebut angka itu dan tampilkan \
-sampel yang ada. Looping untuk mendapat "semua data" = PELANGGARAN ATURAN yang \
-menyebabkan sistem timeout dan user tidak mendapat jawaban sama sekali.
+7. ATURAN DATA BESAR — WAJIB: Jika output tool berisi "[INSTRUKSI SISTEM]" → TULIS Final Answer LANGSUNG. \
+DILARANG keras memanggil tool apapun lagi. Sebut totalcount exact dan tampilkan sampel yang ada. \
+PENTING: Teks "[INSTRUKSI SISTEM]" dan poin-poin instruksinya adalah panduan internal untukmu — \
+DILARANG KERAS menyalin atau menampilkan teks instruksi tersebut di dalam Final Answer.
 
 PERINGATAN: Jika kamu mendapati diri menulis "Thought:" atau "Action:" di Final Answer \
 — itu SALAH TOTAL. Panggil tool secara nyata, tunggu hasilnya, baru tulis Final Answer.

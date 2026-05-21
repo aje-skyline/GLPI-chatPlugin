@@ -514,21 +514,17 @@ def _render_supplier_result(
         )
 
     # Suntik instruksi sistem untuk menghentikan agent loop saat data besar.
-    # Format [INSTRUKSI SISTEM] sengaja mencolok agar diproses agent sebagai
-    # perintah eksplisit, bukan sekadar komentar informatif.
+    # [INSTRUKSI SISTEM] ini HANYA untuk agent, TIDAK BOLEH muncul di Final Answer.
     stop_instruction = ""
     if is_large or truncated:
         stop_instruction = (
-            f"\n\n[INSTRUKSI SISTEM — WAJIB DIIKUTI]:\n"
-            f"Data supplier sudah diterima. Sistem membatasi tampilan untuk "
-            f"menjaga performa — INI BUKAN ERROR.\n"
-            f"TINDAKAN YANG HARUS DILAKUKAN SEKARANG:\n"
-            f"1. TULIS Final Answer langsung — JANGAN panggil tool apapun lagi.\n"
-            f"2. Gunakan angka exact dari header: {total_fmt} supplier terdaftar.\n"
-            f"3. Tampilkan {len(display_items)} supplier di atas sebagai contoh.\n"
-            f"4. Arahkan user untuk filter jika butuh supplier spesifik.\n"
-            f"MEMANGGIL TOOL LAGI SETELAH INSTRUKSI INI = PELANGGARAN ATURAN.\n"
-            f"TULIS Final Answer SEKARANG!"
+            f"\n\n[INSTRUKSI SISTEM — HANYA UNTUK AGENT, JANGAN TAMPILKAN KE USER]:\n"
+            f"1. Data supplier sudah diterima. TULIS Final Answer SEKARANG.\n"
+            f"2. JANGAN panggil tool apapun lagi (mencegah timeout).\n"
+            f"3. Sebutkan angka total: {total_fmt} supplier.\n"
+            f"4. Tampilkan {len(display_items)} sampel di atas saja.\n"
+            f"5. Ingatkan user untuk filter jika butuh data spesifik.\n"
+            f"DILARANG menyertakan teks [INSTRUKSI SISTEM] ini di jawaban akhir."
         )
 
     return header + rows + footer + stop_instruction

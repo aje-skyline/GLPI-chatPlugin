@@ -216,17 +216,15 @@ def _build_task_description(
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Panduan Format Pemikiran (Thought Process)]
+WAJIB SINGKAT (Max 1-2 kalimat). Format:
+Thought: User ingin [X]. Saya akan memanggil tool [Y].
+(Lalu langsung Action. Setelah hasil tool → Final Answer TANPA thought lagi).
 
-Setiap kali kamu menulis "Thought:", WAJIB SINGKAT — maksimal 2-3 kalimat.
-Format yang benar:
-  Thought: User ingin [X]. Saya akan memanggil tool [Y] untuk mendapatkan data.
-  (lalu langsung tulis Action)
-
-Hindari format berikut untuk mencegah error:
-  Thought: Baiklah, saya perlu mempertimbangkan bahwa... [paragraf panjang]
-  Thought: Menganalisis permintaan user secara mendalam... [repetisi panduan]
-
-Setelah menerima hasil tool → LANGSUNG tulis "Final Answer:" tanpa Thought tambahan.
+ATURAN DATA BESAR:
+Jika hasil tool berisi "[INSTRUKSI SISTEM]" → TULIS Final Answer LANGSUNG.
+DILARANG panggil tool lagi. Sebut totalcount exact + 5 sampel saja.
+PENTING: JANGAN tampilkan/copy teks "[INSTRUKSI SISTEM]" ke user.
+Looping tool = TIMEOUT = Error.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PANDUAN PENGERJAAN:
@@ -235,33 +233,19 @@ PANDUAN PENGERJAAN:
    ("komputer tadi", "tiket itu") → JANGAN panggil tool lagi.
 
 2. Jika data belum ada, pilih tool yang sesuai:
-   • Jumlah/total komputer      → count_all_computers
-   • Jumlah/total supplier      → count_suppliers
-   • Panduan/KB                 → search_knowledge_base
-   • Semua komputer + statistik → get_all_computers
-   • Cari komputer              → search_computer
-   • Komputer by lokasi         → get_computers_by_location
-   • Komputer by status         → get_computers_by_status
-   • Komputer by OS             → get_computers_by_os
-   • Aset milik user            → get_user_assets ({uid_label})
-   • Detail komputer by ID      → get_computer_detail
-   • Tiket user                 → get_user_tickets ({uid_label})
-   • Profil user                → get_user_info ({uid_label})
-   • Kontrak                    → list_all_contracts
-   • Detail kontrak by ID       → get_contract_detail
-   • Supplier list/detail/cari  → get_suppliers  (lihat panduan bawah)
-   • Kategori ITIL              → get_itil_categories
+   • Total/Hitung (Computer/Supplier) → count_all_computers / count_suppliers
+   • Daftar Komputer (Semua/Filter)   → get_all_computers / search_computer
+   • Komputer by Status/Lokasi/OS     → get_computers_by_status / _location / _os
+   • Tiket/Aset/Profil (Milik Saya)   → get_user_tickets / get_user_assets / get_user_info
+   • Detail Spesifik (ID)             → get_computer_detail / get_contract_detail
+   • Supplier / Kontrak / KB / ITIL   → get_suppliers / list_all_contracts / search_knowledge_base / get_itil_categories
 
-3. WAJIB: Semua tool yang butuh user_id → gunakan {uid_label}.
+3. Gunakan {uid_label} jika tool membutuhkan user_id.
 
 {_LARGE_DATA_GUIDANCE}
-
 {_SUPPLIER_TOOL_GUIDANCE}
 
-4. Tulis Final Answer dalam Bahasa Indonesia yang sopan dan natural.
-   Pastikan output terakhir hanya menggunakan teks natural, bukan JSON,
-   "Action:", "Thought:", atau format internal apapun.
-   Gunakan angka dari output tool — JANGAN tebak-tebak.
+4. Final Answer: Bahasa Indonesia, sopan, NO JSON/Thought/Action tags.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
 

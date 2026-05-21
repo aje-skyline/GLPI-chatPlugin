@@ -43,20 +43,20 @@ logger = logging.getLogger(__name__)
 # ── Konstanta ─────────────────────────────────────────────────────────────────
 
 # Field ID untuk /search/Supplier yang digunakan pada forcedisplay[] DAN
-# criteria[]. Sumber: GLPI 10.x standard field mapping.
+# criteria[]. Sumber: GLPI 10.x standard field mapping (verified).
 # Verifikasi via: GET /listSearchOptions/Supplier
 _SUPPLIER_FIELD_IDS: dict[str, int] = {
-    "id":       2,
-    "name":     1,
-    "entity":   80,
-    "phone":    4,
-    "fax":      5,
-    "email":    6,
-    "address":  19,
-    "postcode": 20,
-    "town":     21,
-    "state":    22,
-    "country":  23,
+    "id":       2,    # ID
+    "name":     1,    # Name
+    "entity":   80,   # Entity
+    "phone":    5,    # Phone
+    "fax":      10,   # Fax
+    "email":    6,    # Email
+    "address":  3,    # Address
+    "postcode": 14,   # Postal code
+    "town":     11,   # City
+    "state":    12,   # State
+    "country":  13,   # Country
 }
 
 # Field yang digunakan sebagai criteria filter (subset dari _SUPPLIER_FIELD_IDS)
