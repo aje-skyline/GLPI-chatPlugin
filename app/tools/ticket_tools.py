@@ -1,6 +1,6 @@
-"""app/tools/ticket_tools.py — Ticket, Knowledge Base, User Info, Contract & Utility Tools.
+"""app/tools/ticket_tools.py — Ticket, Knowledge Base, User Info & Utility Tools.
 
-Berisi CrewAI Tool yang tidak masuk ke domain computer atau supplier:
+Berisi CrewAI Tool yang tidak masuk ke domain computer, supplier, atau contract:
 
   Knowledge Base:
     - SearchKnowledgeBaseTool  (search_knowledge_base)
@@ -9,10 +9,6 @@ Berisi CrewAI Tool yang tidak masuk ke domain computer atau supplier:
     - GetTicketsTool           (get_user_tickets)
     - GetUserInfoTool          (get_user_info)
 
-  Contracts:
-    - GetContractsTool         (list_all_contracts)
-    - GetContractDetailTool    (get_contract_detail)
-
   Utilities:
     - GetMultipleItemsTool     (get_multiple_items)
     - ListSearchOptionsTool    (list_search_options)
@@ -20,7 +16,9 @@ Berisi CrewAI Tool yang tidak masuk ke domain computer atau supplier:
 
 ATURAN ARSITEKTUR:
   - Pengambilan data HANYA melalui app.repository.* (ticket_repository /
-    asset_repository / utility_repository).
+    utility_repository).
+  - Tool kontrak (GetContractsTool, GetContractDetailTool) telah dipindahkan
+    ke app.tools.contract_tools sesuai Clean Architecture — domain terpisah.
   - Eksekusi async HANYA melalui app.infrastructure.async_runner.run_async.
   - Formatting output dilakukan inline di sini (data cukup sederhana, tidak
     memerlukan formatter khusus yang perlu di-share).
@@ -29,7 +27,6 @@ ATURAN ARSITEKTUR:
 
 from __future__ import annotations
 
-import datetime
 import logging
 from typing import Any, Type
 
@@ -37,7 +34,7 @@ from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 
 from app.infrastructure.async_runner import run_async
-from app.repository import asset_repository, ticket_repository, utility_repository
+from app.repository import ticket_repository, utility_repository
 
 logger = logging.getLogger(__name__)
 
@@ -68,26 +65,6 @@ class GetUserInfoInput(BaseModel):
         ...,
         ge=0,
         description="ID user GLPI.",
-    )
-
-
-class GetContractsInput(BaseModel):
-    computer_id: int = Field(
-        default=0,
-        ge=0,
-        description="ID komputer (opsional). Jika 0, ambil semua kontrak.",
-    )
-    active_only: bool = Field(
-        default=False,
-        description="Jika True, filter hanya kontrak yang masih aktif.",
-    )
-
-
-class GetContractDetailInput(BaseModel):
-    contract_id: int = Field(
-        ...,
-        gt=0,
-        description="ID kontrak di GLPI.",
     )
 
 
@@ -240,83 +217,6 @@ class GetUserInfoTool(BaseTool):
         except Exception as exc:
             logger.error("User info failed: %s", exc)
             return f"Gagal mengambil profil user: {exc}"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Contracts
-# ══════════════════════════════════════════════════════════════════════════════
-
-class GetContractsTool(BaseTool):
-    """Ambil daftar kontrak dari GLPI, dengan opsi filter per komputer atau active only."""
-
-    name: str = "list_all_contracts"
-    description: str = (
-        "Ambil daftar kontrak dari GLPI. Bisa difilter berdasarkan komputer "
-        "atau hanya kontrak aktif."
-    )
-    args_schema: Type[BaseModel] = GetContractsInput
-
-    def _run(self, computer_id: int = 0, active_only: bool = False) -> str:
-        try:
-            results: list[dict[str, Any]] = run_async(
-                asset_repository.get_contracts(computer_id=computer_id)
-            )
-            if not results:
-                return "Tidak ada kontrak ditemukan di GLPI."
-
-            if active_only:
-                today   = datetime.date.today().isoformat()
-                results = [
-                    c for c in results
-                    if not c.get("end_date") or c.get("end_date", "") >= today
-                ]
-                if not results:
-                    return "Tidak ada kontrak aktif ditemukan."
-
-            output = f"Daftar kontrak ({len(results)} item):\n\n"
-            for c in results:
-                output += (
-                    f"• **{c.get('name') or '-'}** (ID: {c.get('id') or '-'})\n"
-                    f"  Nomor    : {c.get('num')        or '(tidak ada)'}\n"
-                    f"  Supplier : {c.get('supplier')   or '(tidak ada)'}\n"
-                    f"  Mulai    : {c.get('begin_date') or '(tidak ada)'}\n"
-                    f"  Berakhir : {c.get('end_date')   or '(tidak ada)'}\n\n"
-                )
-            return output
-        except Exception as exc:
-            logger.error("GetContractsTool failed: %s", exc)
-            return f"Gagal mengambil kontrak: {exc}"
-
-
-class GetContractDetailTool(BaseTool):
-    """Ambil detail lengkap satu kontrak berdasarkan ID-nya."""
-
-    name: str = "get_contract_detail"
-    description: str = "Ambil detail lengkap satu kontrak berdasarkan ID-nya."
-    args_schema: Type[BaseModel] = GetContractDetailInput
-
-    def _run(self, contract_id: int) -> str:
-        try:
-            c: dict[str, Any] | None = run_async(
-                asset_repository.get_contract_by_id(contract_id)
-            )
-            if not c:
-                return f"Kontrak dengan ID {contract_id} tidak ditemukan di GLPI."
-
-            output  = f"Detail Kontrak (ID: {contract_id}):\n\n"
-            output += f"  Nama     : {c.get('name')       or '-'}\n"
-            output += f"  Nomor    : {c.get('num')        or '(tidak ada)'}\n"
-            output += f"  Supplier : {c.get('supplier')   or '(tidak ada)'}\n"
-            output += f"  Tipe     : {c.get('type')       or '(tidak ada)'}\n"
-            output += f"  Mulai    : {c.get('begin_date') or '(tidak ada)'}\n"
-            output += f"  Durasi   : {c.get('duration')   or '(tidak ada)'} bulan\n"
-            output += f"  Berakhir : {c.get('end_date')   or '(tidak ada)'}\n"
-            if c.get("comment"):
-                output += f"  Catatan  : {c['comment']}\n"
-            return output
-        except Exception as exc:
-            logger.error("GetContractDetailTool failed: %s", exc)
-            return f"Gagal mengambil detail kontrak: {exc}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
