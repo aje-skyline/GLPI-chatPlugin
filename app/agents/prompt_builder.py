@@ -19,6 +19,13 @@ CHANGELOG:
           Memindahkan _HISTORY_WINDOW, _LARGE_DATA_GUIDANCE,
           _SUPPLIER_TOOL_GUIDANCE, _format_history(), _build_task_description(),
           _MAX_STORED_ANSWER_LEN, dan _compress_for_history().
+  v1.1 — Tambah _CONTRACT_TOOL_GUIDANCE untuk panduan penggunaan tool kontrak.
+          Disuntikkan ke _build_task_description agar Agent tahu kapan dan
+          bagaimana harus menggunakan count_contracts / list_all_contracts /
+          get_contract_detail. Panduan mencakup aturan Smart Pagination dan
+          flag [INSTRUKSI SISTEM] yang disisipkan tool saat data kontrak
+          melebihi threshold tampilan.
+  v1.2 — Perbaiki karakter stray di _CONTRACT_TOOL_GUIDANCE baris panduan A).
 """
 
 from __future__ import annotations
@@ -98,6 +105,37 @@ PEMETAAN INTENT → TOOL:
 "berapa supplier + daftarnya"          → count_suppliers() LALU get_suppliers(limit=5)
 """
 
+_CONTRACT_TOOL_GUIDANCE: str = """
+   2 [PANDUAN KONTRAK]
+   3 - User tanya JUMLAH -> count_contracts()
+   4 - User tanya DAFTAR -> list_all_contracts()
+   5 - JANGAN panggil keduanya sekaligus. list_all_contracts sudah memberikan total count.
+   6 - Jika data > 5, cukup sebutkan totalnya dan berikan 5 sampel saja.
+
+ATURAN WAJIB UNTUK "DAFTAR SEMUA" / "TAMPILKAN SEMUA KONTRAK":
+1. PANGGIL list_all_contracts() — SEKALI SAJA.
+2. Jika total > 5: tampilkan 5 sampel saja dan sebutkan totalnya ke user.
+3. Setelah tool mengembalikan output dengan [INSTRUKSI SISTEM — WAJIB DIIKUTI]:
+   → TULIS Final Answer LANGSUNG. JANGAN panggil tool apapun lagi.
+   → JANGAN coba limit lebih besar atau filter tambahan untuk mendapatkan "sisa" data.
+4. Sampaikan ke user: "Terdapat X kontrak terdaftar. Berikut 5 sampel.
+   Sebutkan nama atau ID spesifik jika ingin melihat detail kontrak tertentu."
+
+⛔ LARANGAN KERAS: Memanggil list_all_contracts lebih dari SATU KALI per pertanyaan
+   (kecuali filter berbeda karena user meminta kontrak spesifik).
+   Looping tool untuk pagination = TIMEOUT SISTEM → user tidak mendapat jawaban.
+
+PEMETAAN INTENT → TOOL:
+"ada berapa kontrak?"                     → count_contracts()
+"daftar semua kontrak"                    → list_all_contracts() — SEKALI SAJA
+"kontrak yang masih aktif"                → list_all_contracts(active_only=True)
+"kontrak untuk komputer ID 42"            → list_all_contracts(computer_id=42)
+"detail kontrak ID 7"                     → get_contract_detail(contract_id=7)
+"info kontrak maintenance server"         → list_all_contracts() → cari ID → get_contract_detail()
+"kontrak aktif milik PC-MARKETING-01"     → search_computer("PC-MARKETING-01") → list_all_contracts(computer_id=<id>, active_only=True)
+"berapa kontrak + daftarnya"              → list_all_contracts()
+"""
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # History Formatter
@@ -149,7 +187,7 @@ def _format_history(messages: list[dict[str, str]], current_message: str) -> str
             lines.append(f"User: {content}")
         elif role == "assistant":
             # Potong jawaban panjang — cukup _MAX_ASSISTANT_CONTENT karakter
-            # untuk memberi konteks bahwa topik ini sudah dijawab.
+            # untuk memberi konteks bahwa topik sudah dijawab.
             if len(content) > _MAX_ASSISTANT_CONTENT:
                 content = (
                     content[:_MAX_ASSISTANT_CONTENT]
@@ -179,6 +217,7 @@ def _build_task_description(
       PANDUAN PENGERJAAN      — tool routing guide lengkap
       _LARGE_DATA_GUIDANCE    — panduan interpretasi data besar
       _SUPPLIER_TOOL_GUIDANCE — panduan khusus tool supplier
+      _CONTRACT_TOOL_GUIDANCE — panduan khusus tool kontrak
 
     Args:
         user_message  : Query user terbaru (pertanyaan saat ini).
@@ -230,20 +269,23 @@ Looping tool = TIMEOUT = Error.
 PANDUAN PENGERJAAN:
 
 1. Periksa riwayat di atas. Jika data sudah ada dan user merujuknya
-   ("komputer tadi", "tiket itu") → JANGAN panggil tool lagi.
+   ("komputer tadi", "tiket itu", "kontrak tersebut") → JANGAN panggil tool lagi.
 
 2. Jika data belum ada, pilih tool yang sesuai:
    • Total/Hitung (Computer/Supplier) → count_all_computers / count_suppliers
+   • Total/Hitung Kontrak             → count_contracts
    • Daftar Komputer (Semua/Filter)   → get_all_computers / search_computer
    • Komputer by Status/Lokasi/OS     → get_computers_by_status / _location / _os
    • Tiket/Aset/Profil (Milik Saya)   → get_user_tickets / get_user_assets / get_user_info
    • Detail Spesifik (ID)             → get_computer_detail / get_contract_detail
-   • Supplier / Kontrak / KB / ITIL   → get_suppliers / list_all_contracts / search_knowledge_base / get_itil_categories
+   • Supplier / KB / ITIL             → get_suppliers / search_knowledge_base / get_itil_categories
+   • Kontrak (Hitung/Daftar/Detail)   → count_contracts / list_all_contracts / get_contract_detail
 
 3. Gunakan {uid_label} jika tool membutuhkan user_id.
 
 {_LARGE_DATA_GUIDANCE}
 {_SUPPLIER_TOOL_GUIDANCE}
+{_CONTRACT_TOOL_GUIDANCE}
 
 4. Final Answer: Bahasa Indonesia, sopan, NO JSON/Thought/Action tags.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""

@@ -13,13 +13,16 @@ Contoh pemakaian di it_support.py:
         tool_get_all_computers,
         tool_get_suppliers,
         tool_count_suppliers,
+        tool_count_contracts,
         # ... dst.
     )
 
 CATATAN UNTUK PEMELIHARAAN:
   - Jika menambah Tool baru, daftarkan instance-nya di sini dan tambahkan
     ke __all__ agar mudah di-discover.
-  - Urutan impor mengikuti domain: computer → supplier → ticket/utility.
+  - Urutan impor mengikuti domain: computer → supplier → contract → ticket/utility.
+  - Tool kontrak diimpor dari app.tools.contract_tools (bukan ticket_tools)
+    sesuai pemisahan domain Clean Architecture.
 """
 
 from __future__ import annotations
@@ -43,11 +46,16 @@ from app.tools.supplier_tools import (
     SearchSuppliersTool,
 )
 
-# ── Ticket / KB / Contract / Utility domain ──────────────────────────────────
-from app.tools.ticket_tools import (
-    GetCategoriesTool,
+# ── Contract domain ──────────────────────────────────────────────────────────
+from app.tools.contract_tools import (
+    CountContractsTool,       # ← ditambahkan
     GetContractDetailTool,
     GetContractsTool,
+)
+
+# ── Ticket / KB / Utility domain ─────────────────────────────────────────────
+from app.tools.ticket_tools import (
+    GetCategoriesTool,
     GetMultipleItemsTool,
     GetTicketsTool,
     GetUserInfoTool,
@@ -84,6 +92,7 @@ tool_get_suppliers:             SearchSuppliersTool        = SearchSuppliersTool
 tool_count_suppliers:           CountSuppliersTool         = CountSuppliersTool()
 
 # Contracts
+tool_count_contracts:           CountContractsTool         = CountContractsTool()   # ← ditambahkan
 tool_get_contracts:             GetContractsTool           = GetContractsTool()
 tool_get_contract_detail:       GetContractDetailTool      = GetContractDetailTool()
 
@@ -114,6 +123,7 @@ __all__ = [
     "tool_get_computers_by_os",
     "tool_get_suppliers",
     "tool_count_suppliers",
+    "tool_count_contracts",           # ← ditambahkan
     "tool_get_contracts",
     "tool_get_contract_detail",
     "tool_get_tickets",
@@ -133,6 +143,7 @@ __all__ = [
     "GetComputersByOsTool",
     "SearchSuppliersTool",
     "CountSuppliersTool",
+    "CountContractsTool",             # ← ditambahkan
     "GetContractsTool",
     "GetContractDetailTool",
     "GetTicketsTool",

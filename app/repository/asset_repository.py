@@ -13,12 +13,17 @@ Endpoint yang digunakan:
 Setiap fungsi mengambil data mentah dari GLPI via ``glpi_get()``, mem-parse
 field-field yang relevan ke format dict standar, lalu mengembalikannya ke
 caller (biasanya Tools layer). Tidak ada logika formatting string di sini.
+
+CATATAN PEMELIHARAAN:
+  Fungsi get_multiple_items() dan list_search_options() telah DIPINDAHKAN
+  ke app.repository.utility_repository (DRY Principle — menghindari duplikasi).
+  Jangan tambahkan kembali di sini. Gunakan utility_repository untuk keperluan
+  multi-itemtype fetch dan discovery field GLPI.
 """
 
 import logging
 from typing import Any
 
-from app.cache import cache_get, cache_set
 from app.infrastructure import glpi_get
 from app.repository._glpi_helpers import clean_value, first_of, strip_html
 from app.repository.pagination import PagedResult, extract_data, get_all_pages
@@ -701,67 +706,3 @@ async def get_computers_expiring_warranty(
     except Exception as exc:
         logger.warning("get_computers_expiring_warranty failed: %s", exc)
         return []
-
-
-async def get_multiple_items(
-    items: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Fetch beberapa item GLPI dari berbagai itemtype sekaligus dalam satu request.
-
-    Menggunakan endpoint ``/getMultipleItems`` yang memungkinkan pengambilan
-    item dari tipe yang berbeda (Computer, Monitor, Printer, dll.) secara batch.
-
-    Args:
-        items: List dict, masing-masing dengan key ``itemtype`` (string nama
-               GLPI itemtype, misal ``"Computer"``) dan ``items_id`` (integer ID).
-
-    Returns:
-        List dict item yang berhasil di-fetch, atau list kosong jika gagal.
-    """
-    try:
-        params: dict[str, Any] = {}
-        for idx, item in enumerate(items):
-            params[f"items[{idx}][itemtype]"] = item["itemtype"]
-            params[f"items[{idx}][items_id]"] = item["items_id"]
-
-        data = await glpi_get("/getMultipleItems", params={
-            **params,
-            "expand_dropdowns": "true",
-        })
-        result: list[Any] = extract_data(data)
-        return [item for item in result if isinstance(item, dict)]
-    except Exception as exc:
-        logger.warning("get_multiple_items failed: %s", exc)
-        return []
-
-
-async def list_search_options(itemtype: str) -> dict[str, Any]:
-    """Fetch daftar field (search options) yang tersedia untuk suatu GLPI itemtype.
-
-    Berguna untuk debugging dan discovery — menunjukkan field ID numerik yang
-    valid untuk criteria[] dan forcedisplay[] pada Search API.
-
-    Hasil di-cache selama TTL default karena schema GLPI tidak berubah selama
-    sesi berjalan.
-
-    Args:
-        itemtype: Nama GLPI itemtype, misal ``"Computer"``, ``"Supplier"``,
-                  ``"Ticket"``.
-
-    Returns:
-        Dict search options dengan key = field ID string, value = metadata field.
-        Dict kosong jika gagal.
-    """
-    cache_key = f"searchopts:{itemtype}"
-    cached = cache_get(cache_key)
-    if cached is not None:
-        return cached  # type: ignore[return-value]
-
-    try:
-        data = await glpi_get(f"/listSearchOptions/{itemtype}")
-        result: dict[str, Any] = data if isinstance(data, dict) else {}
-        cache_set(cache_key, result)
-        return result
-    except Exception as exc:
-        logger.warning("list_search_options failed (itemtype=%s): %s", itemtype, exc)
-        return {}

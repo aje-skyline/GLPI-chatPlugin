@@ -166,7 +166,7 @@ def _get_llm() -> LLM:
                 api_key=settings.ai_gateway_api_key,
                 api_base=settings.resolved_ai_gateway_base_url,
                 temperature=1,
-                max_tokens=2500,
+                max_tokens=4096,
             )
             logger.info(
                 "LLM singleton created (model=%s, temperature=1, max_tokens=2500)",
