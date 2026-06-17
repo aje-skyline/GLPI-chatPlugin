@@ -170,6 +170,13 @@ async def get_session_token() -> str:
             _session_waiter = None
         if not waiter.done():
             waiter.set_exception(exc)
+            # Panggil exception() untuk menandai exception sebagai 'retrieved',
+            # mencegah warning "Future exception was never retrieved" jika tidak ada
+            # coroutine lain yang sedang menunggu (misal tidak ada concurrent request).
+            try:
+                waiter.exception()
+            except asyncio.InvalidStateError:
+                pass
         raise
 
 

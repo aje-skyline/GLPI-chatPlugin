@@ -48,15 +48,15 @@ logger = logging.getLogger(__name__)
 _SUPPLIER_FIELD_IDS: dict[str, int] = {
     "id":       2,    # ID
     "name":     1,    # Name
-    "entity":   80,   # Entity
-    "phone":    5,    # Phone
-    "fax":      10,   # Fax
+    "entity":   80,   # Entity (entities_id)
+    "phone":    4,    # Phonenumber (Sebelumnya 5)
+    "fax":      5,    # Fax (Sebelumnya 10)
     "email":    6,    # Email
-    "address":  3,    # Address
-    "postcode": 14,   # Postal code
-    "town":     11,   # City
-    "state":    12,   # State
-    "country":  13,   # Country
+    "address":  19,   # Address (Sebelumnya 3)
+    "postcode": 20,   # Postal code (Sebelumnya 14)
+    "town":     21,   # Town / City (Sebelumnya 11)
+    "state":    22,   # State (Sebelumnya 12)
+    "country":  23,   # Country (Sebelumnya 13)
 }
 
 # Field yang digunakan sebagai criteria filter (subset dari _SUPPLIER_FIELD_IDS)
@@ -174,23 +174,25 @@ def _build_search_params(
 
 
 # ── Public functions ──────────────────────────────────────────────────────────
-
 async def count_suppliers() -> int:
-    """Hitung jumlah total supplier yang terdaftar di GLPI (exact count).
-
-    Hanya 1 API call — sangat cepat. Digunakan untuk menjawab pertanyaan
-    "ada berapa supplier?" tanpa fetch semua data.
-
-    Returns:
-        Integer jumlah total supplier, atau 0 jika gagal.
-    """
-    try:
-        data = await glpi_get("/search/Supplier", params={"range": "0-1"})
-        if isinstance(data, dict):
-            return int(data.get("totalcount", 0))
-        return 0
-    except Exception as exc:
-        logger.warning("count_suppliers failed: %s", exc)
+    """Hitung total supplier yang terdaftar di GLPI.""" 
+    target_url = "search/Supplier" 
+    
+    params = { 
+        "countonly": "true", 
+        "forcedisplay[0]": 1,
+        "is_recursive": "true"  # <-- Tambahkan baris ini
+    } 
+    
+    try: 
+        raw = await glpi_get(target_url, params=params) 
+        if isinstance(raw, dict) and "totalcount" in raw: 
+            return int(raw["totalcount"]) 
+        if isinstance(raw, float | int): 
+            return int(raw) 
+        return 0 
+    except Exception as e: 
+        logger.warning("count_suppliers failed: %s", e) 
         return 0
 
 
@@ -247,7 +249,11 @@ async def search_suppliers(
     )
 
     # ── SATU API call dengan forcedisplay lengkap ─────────────────────────────
-    params = _build_search_params(active_filters, limit)
+    params: dict[str, Any] = {
+        "range": f"0-{limit-1}",
+        "is_recursive": "true",  # <-- Tambahkan juga di sini
+        **_SUPPLIER_FORCEDISPLAY
+    }
 
     try:
         raw = await glpi_get("/search/Supplier", params=params)

@@ -4,7 +4,7 @@
 
 **GLPI AI Gateway** is a FastAPI-based chatbot that provides an OpenAI-compatible API for querying GLPI (IT Asset Management) data using CrewAI agents. The system acts as a bridge between a front-end chat interface and a GLPI instance.
 
-**Version:** 2.2.0
+**Version:** 2.3.0
 **Architecture:** FastAPI + CrewAI + LiteLLM (Nemotron)
 
 ## Technology Stack
@@ -22,18 +22,25 @@
 chatbot-fastapi/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                  # FastAPI entry point (v2.2.0)
+│   ├── main.py                  # FastAPI entry point (v2.3.0)
 │   ├── config.py                # Settings & environment variables
-│   ├── crew_services.py         # CrewAI orchestration
 │   ├── tools.py                 # CrewAI tools (GLPI wrappers) + bg event loop
 │   ├── it_glpi_client.py        # GLPI REST API client + TTL cache
-│   └── agents/
-│       ├── __init__.py
-│       └── it_support.py        # IT Support Agent definition
+│   ├── utils.py                 # Sanitize agent output
+│   ├── agents/
+│   │   ├── __init__.py
+│   │   ├── agent_factory.py     # LLM & Agent singleton factory
+│   │   ├── prompt_builder.py    # Task description builder
+│   │   └── it_support.py        # IT Support Agent definition
+│   ├── services/
+│   │   └── crew_orchestrator.py # Crew execution with 429 retry
+│   └── infrastructure/
+│       ├── glpi_gateway.py      # GLPI REST client with retry
+│       └── async_runner.py      # Async timeout wrapper
 ├── .env                         # Environment config (gitignored)
 ├── .env.example                 # Template for .env
 ├── pyproject.toml               # Project metadata & dependencies
-└── CLAUDE.md                   # This file
+└── CLAUDE.md                    # This file
 ```
 
 ## API Endpoints
@@ -68,14 +75,21 @@ chatbot-fastapi/
 }
 ```
 
-## Session Management
+## Session Management & Conversational Flow
 
-The system maintains in-memory sessions with:
+The system maintains multi-turn conversation sessions using **CrewAI Flows** and an in-memory fallback.
+- **GLPIChatFlow**: A CrewAI Flow decorated with `@persist()` that automatically manages conversation turns.
+- **GLPIChatState**: Pydantic model storing `id` (session UUID), `glpi_user_id`, `current_message`, `conversation_history`, and `final_response`.
 - **Session ID resolution**: body > X-Session-ID header > MD5 fingerprint > random UUID
-- **History merge**: Incoming messages merged with stored session history
+- **History merge**: Incoming messages merged with stored session history, passed into `GLPIChatState`.
 - **User ID persistence**: `glpi_user_id` stored per session
 - **Session TTL**: 60 minutes (configurable)
 - **Max messages per session**: 20
+
+### Intelligent Routing
+The `GLPIChatFlow` includes a `@router` step that classifies incoming messages using LiteLLM.
+- **Casual Branch**: Greetings and pleasantries are handled quickly without invoking heavy Crew/Tools.
+- **Technical Branch**: GLPI queries are routed to the `run_crew` orchestrator.
 
 ## Streaming Support
 
@@ -121,10 +135,14 @@ The IT Support Agent has strict rules:
 3. **MUST NOT** display internal format (JSON, Thought, Action)
 4. **MUST** use Indonesian language
 
+### 429 Rate-Limit Retry
+The orchestrator implements exponential backoff (5s → 10s → 20s, max 3 retries) for OpenAI `RateLimitError` on both blocking and async crew execution paths.
+
 ### Key Bugs Fixed
 - **v2.1**: Fixed session history merge logic (exclude only last user message)
 - **v2.1**: Fixed event loop/async lock issues (lazy initialization)
 - **v2.2**: Emulated SSE streaming for PHP compatibility
+- **v2.3**: Fixed model default from `gpt-5-mini` to `qwen/qwen3-next-80b-a3b-instruct`, added 429 retry with backoff, fixed `NEMOTRON_MODEL` → `AI_MODEL` env var
 
 ## Environment Variables
 
@@ -133,7 +151,7 @@ The IT Support Agent has strict rules:
 AI_GATEWAY_URL=https://ai-gw.example.com/v1/chat/completions
 AI_GATEWAY_BASE_URL=https://ai-gw.example.com/v1
 AI_GATEWAY_API_KEY=sk-xxx
-NEMOTRON_MODEL=qwen/qwen3-next-80b-a3b-instruct
+AI_MODEL=qwen/qwen3-next-80b-a3b-instruct
 
 # FastAPI Security
 GATEWAY_API_KEY=your-secret

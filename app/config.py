@@ -20,7 +20,7 @@ class Settings(BaseSettings):
         ai_gateway_url        : URL lengkap AI Gateway (mis. https://ai-gw/v1/chat/completions).
         ai_gateway_base_url   : Base URL tanpa suffix endpoint (opsional, auto-resolved).
         ai_gateway_api_key    : API key untuk autentikasi ke AI Gateway.
-        ai_model              : Nama model (tanpa prefix provider, mis. "gpt-5-mini").
+        ai_model              : Nama model lengkap (termasuk prefix provider), mis. "qwen/qwen3-next-80b-a3b-instruct".
         gateway_api_key       : Bearer token untuk mengamankan endpoint FastAPI ini.
         allowed_origins       : CORS allowed origins (comma-separated).
         glpi_url              : Base URL instance GLPI.
@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     ai_gateway_url: str
     ai_gateway_base_url: str = ""
     ai_gateway_api_key: str
-    ai_model: str = "gpt-5-mini"
+    ai_model: str = "qwen/qwen3-next-80b-a3b-instruct"
 
     # ── FastAPI Gateway security ───────────────────────────────────────────────
     gateway_api_key: str
@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     glpi_url: str       = "https://172.16.14.141"
     glpi_app_token: str = ""
     glpi_user_token: str = ""
-    glpi_api_url: str   = "https://172.16.14.141/asset/apirest.php"
+    glpi_api_url: str   = "https://172.16.14.103/asset/apirest.php"
     glpi_verify_ssl: bool = False
 
     # ── Session store ──────────────────────────────────────────────────────────

@@ -151,7 +151,9 @@ def get_base_headers() -> dict[str, str]:
     Returns:
         Dict header dengan ``Content-Type`` dan ``App-Token``.
     """
-    return {
+    headers = {
         "Content-Type": "application/json",
-        "App-Token": settings.glpi_app_token,
     }
+    if settings.glpi_app_token:
+        headers["App-Token"] = settings.glpi_app_token
+    return headers

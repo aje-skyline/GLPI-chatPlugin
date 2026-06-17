@@ -29,15 +29,43 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from typing import Any
+import time
+from typing import Any, Callable, TypeVar
 
 from crewai import Crew, Process, Task
+from openai import RateLimitError
 
 from app.agents.agent_factory import _get_agent
 from app.agents.prompt_builder import _build_task_description
 from app.utils import sanitize_agent_output
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+# Retry config untuk 429 rate-limit
+_MAX_RETRIES: int = 3
+_RETRY_BACKOFF: tuple[float, ...] = (5.0, 10.0, 20.0)
+
+
+def _retry_on_rate_limit(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Execute func dengan retry exponential backoff saat 429 rate-limit."""
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except RateLimitError as exc:
+            last_exc = exc
+            if attempt < _MAX_RETRIES - 1:
+                wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
+                logger.warning(
+                    "Rate limit hit (attempt %d/%d), retrying in %.1fs…",
+                    attempt + 1,
+                    _MAX_RETRIES,
+                    wait,
+                )
+                time.sleep(wait)
+    raise last_exc  # type: ignore[misc]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -194,7 +222,7 @@ def run_crew(
     )
 
     try:
-        result: Any  = crew.kickoff()
+        result: Any  = _retry_on_rate_limit(crew.kickoff)
         clean_str    = sanitize_agent_output(str(result))
 
         logger.info(
@@ -306,7 +334,25 @@ async def run_crew_async(
     try:
         # kickoff_async() internally calls asyncio.to_thread(self.kickoff)
         # sehingga tidak mem-block event loop FastAPI.
-        result: Any = await crew.kickoff_async()
+        last_exc: Exception | None = None
+        result: Any = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                result = await crew.kickoff_async()
+                break
+            except RateLimitError as exc:
+                last_exc = exc
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
+                    logger.warning(
+                        "Rate limit hit (attempt %d/%d), retrying in %.1fs…",
+                        attempt + 1,
+                        _MAX_RETRIES,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+        if result is None and last_exc is not None:
+            raise last_exc
         clean_str   = sanitize_agent_output(str(result))
 
         logger.info(

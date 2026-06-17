@@ -169,7 +169,7 @@ def _get_llm() -> LLM:
                 max_tokens=4096,
             )
             logger.info(
-                "LLM singleton created (model=%s, temperature=1, max_tokens=2500)",
+                "LLM singleton created (model=%s, temperature=1, max_tokens=4096)",
                 settings.ai_model,
             )
     return _llm_instance

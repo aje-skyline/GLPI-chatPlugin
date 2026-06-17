@@ -449,14 +449,21 @@ async def chat_completions(request: Request, response: Response):
 
     try:
         loop = asyncio.get_event_loop()
+        
+        from app.services.conversational_flow import ConversationalFlow
+        flow = ConversationalFlow()
+        flow.state.user_id = glpi_user_id
+        flow.state.current_message = user_message
+        flow.state.history = messages
+
         # v8.0: Tambah asyncio.wait_for dengan timeout 80s agar non-streaming
         # path juga terlindungi (sebelumnya tidak ada timeout eksplisit di sini).
-        final_answer: str = await asyncio.wait_for(
-            loop.run_in_executor(
-                None, run_crew, user_message, glpi_user_id, messages
-            ),
+        await asyncio.wait_for(
+            flow.kickoff_async(),
             timeout=80.0,
         )
+        
+        final_answer = flow.state.final_output
 
         _save_to_session(session_id, messages, final_answer)
 
@@ -464,7 +471,7 @@ async def chat_completions(request: Request, response: Response):
             "id": f"glpi-crew-{uuid.uuid4().hex[:8]}",
             "object": "chat.completion",
             "model": settings.ai_model,
-            "session_id": _strip_session_prefix(session_id),
+            "session_id": flow.state.id,
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": final_answer},
