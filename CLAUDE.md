@@ -4,7 +4,7 @@
 
 **GLPI AI Gateway** is a FastAPI-based chatbot that provides an OpenAI-compatible API for querying GLPI (IT Asset Management) data using CrewAI agents. The system acts as a bridge between a front-end chat interface and a GLPI instance.
 
-**Version:** 2.3.0
+**Version:** 3.0.0
 **Architecture:** FastAPI + CrewAI + LiteLLM (Nemotron)
 
 ## Technology Stack
@@ -22,21 +22,41 @@
 chatbot-fastapi/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                  # FastAPI entry point (v2.3.0)
-│   ├── config.py                # Settings & environment variables
-│   ├── tools.py                 # CrewAI tools (GLPI wrappers) + bg event loop
-│   ├── it_glpi_client.py        # GLPI REST API client + TTL cache
-│   ├── utils.py                 # Sanitize agent output
+│   ├── main.py                  # FastAPI entry point (v3.0.0)
+│   ├── config.py                # Pydantic Settings & environment variables
+│   ├── cache.py                 # In-memory TTL cache
+│   ├── utils.py                 # Agent output sanitizer
 │   ├── agents/
 │   │   ├── __init__.py
 │   │   ├── agent_factory.py     # LLM & Agent singleton factory
-│   │   ├── prompt_builder.py    # Task description builder
-│   │   └── it_support.py        # IT Support Agent definition
+│   │   └── prompt_builder.py    # Task description builder
+│   ├── infrastructure/
+│   │   ├── __init__.py
+│   │   ├── async_runner.py      # Background event loop
+│   │   ├── glpi_gateway.py      # GLPI REST client with retry
+│   │   ├── http_client.py       # Shared httpx client
+│   │   └── session_manager.py   # GLPI session lifecycle
+│   ├── repository/
+│   │   ├── __init__.py
+│   │   ├── _glpi_helpers.py     # Parsing helpers
+│   │   ├── asset_repository.py  # Computer data (708 lines)
+│   │   ├── contract_repository.py
+│   │   ├── pagination.py        # Auto-pagination
+│   │   ├── supplier_repository.py
+│   │   ├── ticket_repository.py
+│   │   └── utility_repository.py
 │   ├── services/
-│   │   └── crew_orchestrator.py # Crew execution with 429 retry
-│   └── infrastructure/
-│       ├── glpi_gateway.py      # GLPI REST client with retry
-│       └── async_runner.py      # Async timeout wrapper
+│   │   ├── __init__.py
+│   │   ├── chat_flow.py         # GLPIChatFlow (CrewAI Flow + persist)
+│   │   ├── conversational_flow.py # ConversationalFlow (simpler async Flow)
+│   │   └── crew_orchestrator.py # Crew execution + SSE + 429 retry
+│   └── tools/
+│       ├── __init__.py          # Tool registry (20 tools)
+│       ├── computer_tools.py    # 9 computer tools
+│       ├── contract_tools.py    # 3 contract tools
+│       ├── formatters.py        # Output formatting
+│       ├── supplier_tools.py    # 2 supplier tools
+│       └── ticket_tools.py      # 6 ticket/KB/utility tools
 ├── .env                         # Environment config (gitignored)
 ├── .env.example                 # Template for .env
 ├── pyproject.toml               # Project metadata & dependencies
@@ -65,8 +85,8 @@ chatbot-fastapi/
 {
   "id": "glpi-crew-xxx",
   "object": "chat.completion",
-  "model": "nemotron-crew/qwen/qwen3-next-80b-a3b-instruct",
-  "session_id": "body:abc-123",
+  "model": "qwen/qwen3-next-80b-a3b-instruct",
+  "session_id": "abc-123",
   "choices": [{
     "index": 0,
     "message": {"role": "assistant", "content": "Jawaban..."},
@@ -77,44 +97,88 @@ chatbot-fastapi/
 
 ## Session Management & Conversational Flow
 
-The system maintains multi-turn conversation sessions using **CrewAI Flows** and an in-memory fallback.
-- **GLPIChatFlow**: A CrewAI Flow decorated with `@persist()` that automatically manages conversation turns.
-- **GLPIChatState**: Pydantic model storing `id` (session UUID), `glpi_user_id`, `current_message`, `conversation_history`, and `final_response`.
-- **Session ID resolution**: body > X-Session-ID header > MD5 fingerprint > random UUID
-- **History merge**: Incoming messages merged with stored session history, passed into `GLPIChatState`.
-- **User ID persistence**: `glpi_user_id` stored per session
-- **Session TTL**: 60 minutes (configurable)
-- **Max messages per session**: 20
+The system supports two conversational flow implementations:
 
-### Intelligent Routing
-The `GLPIChatFlow` includes a `@router` step that classifies incoming messages using LiteLLM.
-- **Casual Branch**: Greetings and pleasantries are handled quickly without invoking heavy Crew/Tools.
-- **Technical Branch**: GLPI queries are routed to the `run_crew` orchestrator.
+### GLPIChatFlow (CrewAI Flow + persist)
+- **Class:** `GLPIChatFlow` in `app/services/chat_flow.py`
+- Decorated with `@persist()` for automatic conversation turn management
+- **GLPIChatState**: Stores `id` (session UUID), `glpi_user_id`, `current_message`, `conversation_history`, and `final_response`
+- Uses a `@router` step to classify messages as **casual** or **technical** via LiteLLM
+- **Casual Branch**: Greetings handled quickly without invoking Crew/Tools
+- **Technical Branch**: GLPI queries routed to `run_crew` orchestrator
+
+### ConversationalFlow (Simpler async Flow)
+- **Class:** `ConversationalFlow` in `app/services/conversational_flow.py`
+- Event-driven: `initialize_interaction()` → `trigger_crew_agent()`
+- Uses `run_crew_async()` for non-blocking execution
+- Used by the streaming path in `main.py`
+
+### Session ID Resolution
+- Priority: `body.session_id` > `X-Session-ID` header > MD5 fingerprint > random UUID
+- Session ID returned in response header `X-Session-ID`
+
+### History Merge
+Incoming messages merged with stored session history via `_merge_conversation_history()`.
+
+### Other Session Properties
+- **User ID persistence**: `glpi_user_id` stored per session
+- **Session TTL**: 60 minutes (configurable via `session_ttl_minutes`)
+- **Max messages per session**: 20 (configurable `_MAX_SESSION_MESSAGES`)
 
 ## Streaming Support
 
-The system implements emulated SSE streaming:
-- **Phase 1**: Status/heartbeat events while CrewAI blocks (every 2-5 seconds)
-- **Phase 2**: Word-by-word answer streaming (~30ms per word)
-- **Phase 3**: `[DONE]` sentinel
+The system implements emulated SSE streaming with OpenAI-compatible chunk format:
+- **Thought events**: Agent reasoning steps streamed as SSE `thought` events
+- **Status heartbeats**: Keep-alive every ~3 seconds with rotating status messages
+- **Word-by-word streaming**: Final answer streamed as OpenAI `data: {...}` chunks (~30ms per word)
+- **Server timeout**: 80 seconds hard cap, then cancels crew execution
+- **Sentinel**: `data: [DONE]\n\n` marks completion
 
 ## CrewAI Tools
 
+The system has **20 tools** registered in `app/tools/__init__.py`:
+
+### Computer Domain (9 tools)
 | Tool | Function |
 |------|----------|
 | `search_knowledge_base` | Search KB articles |
 | `get_user_assets` | Get computers owned by user |
-| `get_all_computers` | List all computers |
+| `get_all_computers` | List all computers (smart pagination) |
 | `get_computer_detail` | Get full computer details |
 | `count_all_computers` | Count total computers |
 | `search_computer_by_name` | Search by computer name |
 | `search_computer` | Universal search (name, serial, inventory) |
-| `list_all_contracts` | List contracts |
+| `get_computers_by_status` | Filter by status |
+| `get_computers_by_location` | Filter by location |
+
+### Computer OS (1 tool)
+| Tool | Function |
+|------|----------|
+| `get_computers_by_os` | Filter by operating system |
+
+### Supplier Domain (2 tools)
+| Tool | Function |
+|------|----------|
+| `get_suppliers` | Search/list suppliers |
+| `count_suppliers` | Count total suppliers |
+
+### Contract Domain (3 tools)
+| Tool | Function |
+|------|----------|
+| `get_contracts` | List contracts |
 | `get_contract_detail` | Get contract details |
+| `count_contracts` | Count total contracts |
+
+### Ticket/User Domain (2 tools)
+| Tool | Function |
+|------|----------|
 | `get_user_tickets` | Get user tickets |
 | `get_user_info` | Get user profile |
+
+### Utility Domain (3 tools)
+| Tool | Function |
+|------|----------|
 | `get_itil_categories` | List ITIL categories |
-| `get_suppliers` | List suppliers |
 | `get_multiple_items` | Fetch multiple item types |
 | `list_search_options` | List GLPI search fields |
 
@@ -142,7 +206,8 @@ The orchestrator implements exponential backoff (5s → 10s → 20s, max 3 retri
 - **v2.1**: Fixed session history merge logic (exclude only last user message)
 - **v2.1**: Fixed event loop/async lock issues (lazy initialization)
 - **v2.2**: Emulated SSE streaming for PHP compatibility
-- **v2.3**: Fixed model default from `gpt-5-mini` to `qwen/qwen3-next-80b-a3b-instruct`, added 429 retry with backoff, fixed `NEMOTRON_MODEL` → `AI_MODEL` env var
+- **v2.3**: Fixed model default to `qwen/qwen3-next-80b-a3b-instruct`, added 429 retry with backoff, renamed `NEMOTRON_MODEL` → `AI_MODEL`
+- **v3.0**: Router-based intent classification, persistent bg event loop, 20 tools
 
 ## Environment Variables
 
@@ -195,15 +260,17 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 ## Development Notes
 
-1. **Verbose mode** is enabled in `crew_services.py` and `it_support.py` — disable in production
+1. **Verbose mode** is enabled in `crew_orchestrator.py` and `agent_factory.py` — disable in production
 2. **MOCK_MODE** can be set in `.env` to test without GLPI
 3. GLPI field IDs in Search API may vary by version — verify with `list_search_options('Computer')`
 4. Session data is in-memory only — lost on restart
 
-## Future Improvements (from README)
+## Future Improvements
 
 1. Add rate limiting to endpoint
 2. Add proper logging config for production
 3. Add GLPI health check to `/health` endpoint
-4. Add more agents (HR, Finance)
+4. Add more agents (SCCM, HR, Finance) — see `docs/planned/` for Phase 2 plans
 5. Add CI/CD workflow
+6. Add direct GLPI DB connector for health analysis
+7. Add Celery + Redis for background workers

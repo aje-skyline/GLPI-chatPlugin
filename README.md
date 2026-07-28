@@ -91,7 +91,7 @@ Beberapa fitur utama yang ditawarkan oleh GLPI AI Gateway:
 
 * **Clean Architecture**: Pemisahan modul yang jelas antara agen, alat, repositori, dan infrastruktur untuk mempermudah pemeliharaan jangka panjang.
 * **REST API Kompatibel OpenAI**: Mendukung endpoint `/v1/chat/completions` dengan dukungan streaming berbasis SSE (*Server-Sent Events*).
-* **CrewAI Native Integration**: Agen IT Support cerdas dengan akses ke 19 tools khusus untuk kueri data GLPI yang aman.
+* **CrewAI Native Integration**: Agen IT Support cerdas dengan akses ke 20 tools khusus untuk kueri data GLPI yang aman.
 * **Smart Pagination**: Sistem paginasi cerdas otomatis untuk kueri inventaris besar untuk menghindari kelebihan memori pada agen dan menghindari *token explosion*.
 * **CrewAI Flows Integrasi**: Menangani *multi-turn chat sessions* secara cerdas. Dilengkapi sistem *router* untuk memisahkan pertanyaan teknis dan sapaan biasa (casual) secara instan.
 * **Manajemen Sesi In-Memory & Persisten**: Sistem state menggunakan Pydantic (`GLPIChatState`) serta dekorator `@persist()` dari CrewAI, digabung dengan *auto-fingerprinting* percakapan.
@@ -152,9 +152,9 @@ Type: `String`
 Default: `None` (Wajib diisi)  
 API key/token otentikasi untuk mengakses layanan AI Gateway.
 
-#### NEMOTRON_MODEL
+#### AI_MODEL
 Type: `String`  
-Default: `"gpt-5-mini"` (Atau model yang ditentukan di `.env`)  
+Default: `"qwen/qwen3-next-80b-a3b-instruct"`  
 Nama model AI yang akan digunakan oleh Agen CrewAI (misal: `qwen/qwen3-next-80b-a3b-instruct`).
 
 #### GATEWAY_API_KEY
@@ -223,3 +223,17 @@ Berikut adalah ringkasan tautan penting terkait proyek ini:
 Kode sumber dan aset di dalam proyek ini dilisensikan di bawah aturan:
 
 "Internal use only."
+
+---
+
+## 📚 Dokumentasi Fase
+
+Dokumentasi proyek dibagi berdasarkan fase:
+
+| Fase | Lokasi | Keterangan |
+|------|--------|------------|
+| **Saat Ini (v3.0.0)** | Root (`README.md`, `CLAUDE.md`, `PROJECT_CONTEXT.md`) | Dokumentasi kode yang sudah berjalan |
+| **Phase 2 (Direncanakan)** | `docs/planned/` | Blueprint, PRD, spesifikasi SCCM/Health/Docker/Celery yang akan datang |
+| **API Contract** | `docs/API-CONTRACT.md` | Kontrak API — endpoint yang sudah ada (v3.0.0) dan yang direncanakan (Phase 2) |
+
+> Dokumen Phase 2 dipisahkan ke subdirektori `docs/planned/` untuk menghindari kebingungan dengan kode yang sudah berjalan saat ini.
