@@ -274,7 +274,7 @@ Looping tool = TIMEOUT = Error.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PANDUAN PENGERJAAN:
 
-1. Periksa riwayat di atas. Jika user MERUJUK data lama ("komputer tadi", "tiket itu") → JANGAN panggil tool lagi. NAMUN, jika user menanyakan ULANG pertanyaan ("Ada berapa total aset") ATAU meminta Anda mengecek ulang, ANDA WAJIB memanggil tool lagi untuk mendapatkan data terbaru dan JANGAN menebak dari memori chat lama!
+1. Periksa riwayat di atas. Jika user MERUJUK data lama ("komputer tadi", "tiket itu") → JANGAN panggil tool lagi. NAMUN, jika user menanyakan ULANG pertanyaan ("Ada berapa total aset") ATAU meminta Anda mengecek ulang ("Coba cek ulang", "Hitung lagi", dsb), ANDA WAJIB memanggil tool (seperti `count_all_computers`) lagi untuk mendapatkan data terbaru dan JANGAN menebak dari memori chat lama!
 
 2. Jika data belum ada di memori chat atau user minta cek ulang, pilih tool yang sesuai:
    • Total/Hitung (Computer/Supplier) → count_all_computers / count_suppliers
