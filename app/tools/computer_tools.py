@@ -85,6 +85,10 @@ class GetComputerDetailInput(BaseModel):
 class CountAllComputersInput(BaseModel):
     call_id: str = Field(default="", exclude=True)
 
+class CountAllAssetsInput(BaseModel):
+    call_id: str = Field(default="", exclude=True)
+
+
 
 class SearchComputerByNameInput(BaseModel):
     name: str = Field(
