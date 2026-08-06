@@ -128,7 +128,8 @@ class GetContractsTool(BaseTool):
         "Tampilkan daftar kontrak GLPI. "
         "Mengembalikan sampel 5 data terbaru beserta total count exact. "
         "Gunakan untuk: 'daftar kontrak', 'tampilkan kontrak aktif', "
-        "'kontrak milik komputer ID X'."
+        "'kontrak milik komputer ID X'. "
+        "Daftar/cari item di GLPI. ⛔ DILARANG KERAS menggunakan tool ini hanya untuk menghitung total/jumlah item! Jika user bertanya 'ada berapa' atau 'total', Anda WAJIB menggunakan tool count_*."
     )
     args_schema: Type[BaseModel] = GetContractsInput
 
@@ -178,6 +179,8 @@ class GetContractsTool(BaseTool):
                     "JANGAN panggil tool lagi. Beritahu user jumlah total dan sampaikan "
                     "jika ingin mencari kontrak spesifik silakan sebutkan nama atau ID-nya."
                 )
+            
+            output += f"\n\n[INSTRUKSI SISTEM]: Data di atas adalah SAMPLE. Total exact di database adalah {total_count}. Tulis Final Answer langsung dari angka total ini dan JANGAN hitung jumlah baris di atas."
 
             return output
 

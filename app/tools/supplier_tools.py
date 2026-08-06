@@ -141,7 +141,7 @@ class SearchSuppliersTool(BaseTool):
         "Bisa menampilkan hingga 50 supplier sekaligus tanpa risiko timeout "
         "karena menggunakan 1 API call (forcedisplay). "
         "Output per supplier: Nama, Entity, Alamat, Telepon, Fax, Email. "
-        "Untuk HANYA menghitung jumlah total, gunakan count_suppliers (lebih cepat)."
+        "Daftar/cari item di GLPI. ⛔ DILARANG KERAS menggunakan tool ini hanya untuk menghitung total/jumlah item! Jika user bertanya 'ada berapa' atau 'total', Anda WAJIB menggunakan tool count_*."
     )
     args_schema: Type[BaseModel] = SupplierSearchInput
 
@@ -191,7 +191,9 @@ class SearchSuppliersTool(BaseTool):
                 # 20 detik adalah headroom 2x yang sangat konservatif.
                 timeout=20.0,
             )
-            return _render_supplier_result(result, filter_label=filter_label)
+            output = _render_supplier_result(result, filter_label=filter_label)
+            output += f"\n\n[INSTRUKSI SISTEM]: Data di atas adalah SAMPLE. Total exact di database adalah {result['totalcount']}. Tulis Final Answer langsung dari angka total ini dan JANGAN hitung jumlah baris di atas."
+            return output
 
         except Exception as exc:
             logger.error("SearchSuppliersTool failed: %s", exc, exc_info=True)

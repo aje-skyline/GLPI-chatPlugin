@@ -215,7 +215,8 @@ class GetAllComputersTool(BaseTool):
         "plus summary statistik (distribusi status/lokasi/OS) jika data > 100, "
         "plus sample data sebagai representasi. "
         "JANGAN gunakan untuk mencari by nama/serial — gunakan search_computer. "
-        "JANGAN gunakan untuk aset milik user tertentu — gunakan get_user_assets."
+        "JANGAN gunakan untuk aset milik user tertentu — gunakan get_user_assets. "
+        "Daftar/cari item di GLPI. ⛔ DILARANG KERAS menggunakan tool ini hanya untuk menghitung total/jumlah item! Jika user bertanya 'ada berapa' atau 'total', Anda WAJIB menggunakan tool count_*."
     )
     args_schema: Type[BaseModel] = GetAllComputersInput
     # Cache aktif: inventaris tidak berubah dalam hitungan detik; mencegah
@@ -246,7 +247,9 @@ class GetAllComputersTool(BaseTool):
                 return f"Tidak ada {label} ditemukan di GLPI."
 
             context = "komputer dengan serial number" if has_serial else "komputer"
-            return _render_paged_result(result, context=context)
+            output = _render_paged_result(result, context=context)
+            output += f"\n\n[INSTRUKSI SISTEM]: Data di atas adalah SAMPLE. Total exact di database adalah {result['totalcount']}. Tulis Final Answer langsung dari angka total ini dan JANGAN hitung jumlah baris di atas."
+            return output
 
         except Exception as exc:
             logger.error("Computer list failed: %s", exc)
@@ -412,7 +415,8 @@ class GetComputersByStatusTool(BaseTool):
         "Cari komputer di GLPI berdasarkan status aset. "
         "Menampilkan total exact + statistik distribusi jika hasil > 100. "
         "Contoh query: 'komputer aktif', 'aset rusak', 'stok tersedia'. "
-        "Pencarian case-insensitive dan partial match."
+        "Pencarian case-insensitive dan partial match. "
+        "Daftar/cari item di GLPI. ⛔ DILARANG KERAS menggunakan tool ini hanya untuk menghitung total/jumlah item! Jika user bertanya 'ada berapa' atau 'total', Anda WAJIB menggunakan tool count_*."
     )
     args_schema: Type[BaseModel] = GetComputersByStatusInput
 
@@ -427,11 +431,13 @@ class GetComputersByStatusTool(BaseTool):
             if not result["items"] and result["totalcount"] == 0:
                 return f"Tidak ada komputer dengan status '{status}' ditemukan di GLPI."
 
-            return _render_paged_result(
+            output = _render_paged_result(
                 result,
                 context="komputer",
                 filter_label=f"dengan status '{status}'",
             )
+            output += f"\n\n[INSTRUKSI SISTEM]: Data di atas adalah SAMPLE. Total exact di database adalah {result['totalcount']}. Tulis Final Answer langsung dari angka total ini dan JANGAN hitung jumlah baris di atas."
+            return output
         except Exception as exc:
             logger.error("Computers by status failed: %s", exc)
             return f"Gagal mencari komputer by status: {exc}"
@@ -445,7 +451,8 @@ class GetComputersByLocationTool(BaseTool):
         "Cari komputer di GLPI berdasarkan lokasi fisiknya. "
         "Menampilkan total exact + statistik distribusi jika hasil > 100. "
         "Contoh query: 'komputer di lantai 2', 'aset di gedung B', 'komputer server room'. "
-        "Pencarian case-insensitive dan partial match."
+        "Pencarian case-insensitive dan partial match. "
+        "Daftar/cari item di GLPI. ⛔ DILARANG KERAS menggunakan tool ini hanya untuk menghitung total/jumlah item! Jika user bertanya 'ada berapa' atau 'total', Anda WAJIB menggunakan tool count_*."
     )
     args_schema: Type[BaseModel] = GetComputersByLocationInput
 
@@ -461,11 +468,13 @@ class GetComputersByLocationTool(BaseTool):
             if not result["items"] and result["totalcount"] == 0:
                 return f"Tidak ada komputer di lokasi '{location}' ditemukan di GLPI."
 
-            return _render_paged_result(
+            output = _render_paged_result(
                 result,
                 context="komputer",
                 filter_label=f"di lokasi '{location}'",
             )
+            output += f"\n\n[INSTRUKSI SISTEM]: Data di atas adalah SAMPLE. Total exact di database adalah {result['totalcount']}. Tulis Final Answer langsung dari angka total ini dan JANGAN hitung jumlah baris di atas."
+            return output
         except Exception as exc:
             logger.error("Computers by location failed: %s", exc)
             return f"Gagal mencari komputer by lokasi: {exc}"
@@ -479,7 +488,8 @@ class GetComputersByOsTool(BaseTool):
         "Cari komputer di GLPI berdasarkan sistem operasi (OS) yang terinstall. "
         "Menampilkan total exact + statistik distribusi jika hasil > 100. "
         "Contoh query: 'komputer Windows 10', 'laptop Ubuntu', 'server Windows Server 2019'. "
-        "Pencarian case-insensitive dan partial match."
+        "Pencarian case-insensitive dan partial match. "
+        "Daftar/cari item di GLPI. ⛔ DILARANG KERAS menggunakan tool ini hanya untuk menghitung total/jumlah item! Jika user bertanya 'ada berapa' atau 'total', Anda WAJIB menggunakan tool count_*."
     )
     args_schema: Type[BaseModel] = GetComputersByOsInput
 
@@ -494,11 +504,13 @@ class GetComputersByOsTool(BaseTool):
             if not result["items"] and result["totalcount"] == 0:
                 return f"Tidak ada komputer dengan OS '{os}' ditemukan di GLPI."
 
-            return _render_paged_result(
+            output = _render_paged_result(
                 result,
                 context="komputer",
                 filter_label=f"dengan OS '{os}'",
             )
+            output += f"\n\n[INSTRUKSI SISTEM]: Data di atas adalah SAMPLE. Total exact di database adalah {result['totalcount']}. Tulis Final Answer langsung dari angka total ini dan JANGAN hitung jumlah baris di atas."
+            return output
         except Exception as exc:
             logger.error("Computers by OS failed: %s", exc)
             return f"Gagal mencari komputer by OS: {exc}"
