@@ -29,6 +29,7 @@ from __future__ import annotations
 
 # ── Computer domain ──────────────────────────────────────────────────────────
 from app.tools.computer_tools import (
+    CountAllAssetsTool,
     CountAllComputersTool,
     GetAllComputersTool,
     GetComputerDetailTool,
@@ -76,6 +77,7 @@ tool_search_kb: SearchKnowledgeBaseTool = SearchKnowledgeBaseTool()
 tool_get_assets:                GetUserAssetsTool          = GetUserAssetsTool()
 tool_get_all_computers:         GetAllComputersTool        = GetAllComputersTool()
 tool_get_computer_detail:       GetComputerDetailTool      = GetComputerDetailTool()
+tool_count_all_assets:        CountAllAssetsTool         = CountAllAssetsTool()
 tool_count_all_computers:       CountAllComputersTool      = CountAllComputersTool()
 
 # Computer — searching
@@ -115,6 +117,7 @@ __all__ = [
     "tool_get_assets",
     "tool_get_all_computers",
     "tool_get_computer_detail",
+    "tool_count_all_assets",
     "tool_count_all_computers",
     "tool_search_computer_by_name",
     "tool_search_computer",

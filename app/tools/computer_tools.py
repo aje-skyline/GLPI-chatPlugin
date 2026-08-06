@@ -277,6 +277,29 @@ class GetComputerDetailTool(BaseTool):
             return f"Gagal mengambil detail komputer: {exc}"
 
 
+class CountAllAssetsTool(BaseTool):
+    """Hitung jumlah total SELURUH aset di GLPI (1 API call)."""
+
+    name: str = "count_all_assets"
+    description: str = (
+        "Ambil TOTAL atau JUMLAH KESELURUHAN SELURUH ASET (Komputer, Monitor, Printer, Network Equipment, dll) "
+        "yang ada di GLPI secara exact. "
+        "Gunakan HANYA jika ditanya 'ada berapa total aset', 'jumlah aset', atau 'total aset' secara umum. "
+        "Jika ditanya jumlah KOMPUTER saja, gunakan count_all_computers."
+    )
+    args_schema: Type[BaseModel] = CountAllAssetsInput
+    cache_function: Any = Field(default=lambda *args, **kwargs: False)
+
+    def _run(self, **kwargs: Any) -> str:
+        try:
+            total: int = run_async(asset_repository.get_total_all_assets_count())
+            total_fmt  = f"{total:,}".replace(",", ".")
+            return f"Total seluruh aset (termasuk Komputer, Monitor, Printer, Network Equipment, dll) yang terdaftar di GLPI adalah **{total_fmt} item**."
+        except Exception as exc:
+            logger.error("CountAllAssetsTool failed: %s", exc)
+            return f"Gagal menghitung jumlah seluruh aset: {exc}"
+
+
 class CountAllComputersTool(BaseTool):
     """Hitung jumlah total komputer di GLPI (cepat, 1 API call)."""
 
