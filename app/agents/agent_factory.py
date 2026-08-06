@@ -165,11 +165,11 @@ def _get_llm() -> LLM:
                 model=f"openai/{settings.ai_model}",
                 api_key=settings.ai_gateway_api_key,
                 api_base=settings.resolved_ai_gateway_base_url,
-                temperature=1,
+                temperature=0.0,
                 max_tokens=4096,
             )
             logger.info(
-                "LLM singleton created (model=%s, temperature=1, max_tokens=4096)",
+                "LLM singleton created (model=%s, temperature=0.0, max_tokens=4096)",
                 settings.ai_model,
             )
     return _llm_instance
