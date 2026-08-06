@@ -34,6 +34,7 @@ from crewai import Agent, LLM
 
 from app.config import settings
 from app.tools import (
+    tool_count_all_assets,
     tool_count_all_computers,
     tool_count_suppliers,
     tool_get_all_computers,
@@ -104,6 +105,8 @@ _TOOLS: list[Any] = [
     tool_get_assets,
     tool_get_all_computers,
     tool_get_computer_detail,
+    tool_count_all_assets,
+    tool_count_all_assets,
     tool_count_all_computers,
     # Computer — searching
     tool_search_computer_by_name,

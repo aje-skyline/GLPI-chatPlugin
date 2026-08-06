@@ -70,12 +70,14 @@ output dalam format SMART PAGINATION:
 ATURAN WAJIB PENCARIAN ASET / KOMPUTER:
 1. "Total: X.XXX" = JUMLAH EXACT dari database — gunakan ini untuk pertanyaan count.
 2. Flag ⚠️ = data ditampilkan hanyalah SAMPLE — sampaikan ke user.
-3. Untuk menghitung JUMLAH TOTAL KESELURUHAN (count without filter) → WAJIB gunakan tool `count_all_computers`.
-4. ⛔ LARANGAN KERAS: JANGAN panggil `get_all_computers` hanya untuk mendapatkan total aset. Jika user bertanya "Ada berapa total aset/komputer", ANDA HARUS memanggil `count_all_computers`.
-5. Untuk count by filter → get_computers_by_location / get_computers_by_status.
+3. Untuk menghitung JUMLAH TOTAL KESELURUHAN ASET (Semua jenis aset) → WAJIB gunakan tool `count_all_assets`.
+4. Untuk menghitung JUMLAH TOTAL KOMPUTER SAJA → WAJIB gunakan tool `count_all_computers`.
+5. ⛔ LARANGAN KERAS: JANGAN panggil `get_all_computers` hanya untuk mendapatkan total aset. 
+6. Untuk count by filter → get_computers_by_location / get_computers_by_status.
 
-PEMETAAN INTENT KOMPUTER → TOOL:
-"Ada berapa total aset GLPI saat ini"  → count_all_computers()
+PEMETAAN INTENT ASET & KOMPUTER → TOOL:
+"Ada berapa total aset GLPI saat ini"  → count_all_assets()
+"Berapa jumlah aset"                   → count_all_assets()
 "Berapa jumlah komputer"               → count_all_computers()
 "Tampilkan semua komputer"             → get_all_computers()
 """
@@ -277,7 +279,7 @@ PANDUAN PENGERJAAN:
 1. Periksa riwayat di atas. Jika user MERUJUK data lama ("komputer tadi", "tiket itu") → JANGAN panggil tool lagi. NAMUN, jika user menanyakan ULANG pertanyaan ("Ada berapa total aset") ATAU meminta Anda mengecek ulang ("Coba cek ulang", "Hitung lagi", dsb), ANDA WAJIB memanggil tool (seperti `count_all_computers`) lagi untuk mendapatkan data terbaru dan JANGAN menebak dari memori chat lama!
 
 2. Jika data belum ada di memori chat atau user minta cek ulang, pilih tool yang sesuai:
-   • Total/Hitung (Computer/Supplier) → count_all_computers / count_suppliers
+   • Total/Hitung (Aset/Computer/Supplier) → count_all_assets / count_all_computers / count_suppliers
    • Total/Hitung Kontrak             → count_contracts
    • Daftar Komputer (Semua/Filter)   → get_all_computers / search_computer
    • Komputer by Status/Lokasi/OS     → get_computers_by_status / _location / _os
