@@ -155,6 +155,7 @@ def _build_search_params(
         Dict params siap pakai untuk glpi_get().
     """
     params: dict[str, Any] = {
+        "is_recursive": "true",
         "expand_dropdowns": "true",   # Konversi ID → nama (entity, dll)
         "sort":             2,        # Sort by ID
         "order":            "DESC",   # Terbaru dulu
@@ -180,8 +181,7 @@ async def count_suppliers() -> int:
     
     params = { 
         "countonly": "true", 
-        "forcedisplay[0]": 1,
-        "is_recursive": "true"  # <-- Tambahkan baris ini
+        "is_recursive": "true"
     } 
     
     try: 
@@ -251,7 +251,7 @@ async def search_suppliers(
     # ── SATU API call dengan forcedisplay lengkap ─────────────────────────────
     params: dict[str, Any] = {
         "range": f"0-{limit-1}",
-        "is_recursive": "true",  # <-- Tambahkan juga di sini
+        "is_recursive": "true",
         **_SUPPLIER_FORCEDISPLAY
     }
 

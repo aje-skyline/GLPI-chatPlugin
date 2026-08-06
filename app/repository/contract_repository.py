@@ -134,8 +134,8 @@ async def count_contracts() -> int:
     """
     try:
         data = await glpi_get("/search/Contract", params={
-            "get_full_count": "true",
-            "range": "0-0",
+            "countonly": "true",
+            "is_recursive": "true",
         })
         if isinstance(data, dict):
             # GLPI menggunakan "totalcount" (bukan "total_count")

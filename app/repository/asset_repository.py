@@ -411,6 +411,7 @@ async def get_user_assets(user_id: int) -> list[dict[str, Any]]:
     for field_id, label in candidate_fields:
         try:
             params: dict[str, Any] = {
+                "is_recursive": "true",
                 "criteria[0][field]":      field_id,
                 "criteria[0][searchtype]": "equals",
                 "criteria[0][value]":      user_id,
@@ -710,6 +711,7 @@ async def get_computers_expiring_warranty(
         forcedisplay[f"forcedisplay[{next_idx}]"] = _INFOCOM_WARRANTY_FIELD
 
         params: dict[str, Any] = {
+            "is_recursive": "true",
             "criteria[0][field]":      _INFOCOM_WARRANTY_FIELD,
             "criteria[0][searchtype]": "morethan",
             "criteria[0][value]":      today_str,

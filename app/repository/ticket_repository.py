@@ -94,6 +94,7 @@ async def fetch_user_tickets(
     for field_id in [4, 22, 64]:
         try:
             data = await glpi_get("/search/Ticket", params={
+                "is_recursive": "true",
                 "criteria[0][field]":      field_id,
                 "criteria[0][searchtype]": "equals",
                 "criteria[0][value]":      glpi_user_id,
