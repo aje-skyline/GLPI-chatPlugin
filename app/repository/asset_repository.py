@@ -217,6 +217,27 @@ async def get_all_computers(
         return await _get_all_computers_fallback(sample_size, has_serial)
 
 
+
+async def get_total_all_assets_count() -> int:
+    """Fetch jumlah total SELURUH aset di GLPI (AllAssets endpoint).
+
+    Termasuk Computer, Monitor, Printer, Peripheral, NetworkEquipment, dsb.
+    
+    Returns:
+        Integer jumlah total keseluruhan aset, atau 0 jika gagal.
+    """
+    try:
+        data = await glpi_get("/search/AllAssets", params={
+            "countonly": "true",
+            "is_recursive": "true",
+        })
+        if isinstance(data, dict) and "totalcount" in data:
+            return int(data["totalcount"])
+        return 0
+    except Exception as exc:
+        logger.warning("get_total_all_assets_count failed: %s", exc)
+        return 0
+
 async def get_total_computers_count() -> int:
     """Fetch jumlah total komputer di GLPI (exact count, 1 API call).
 
