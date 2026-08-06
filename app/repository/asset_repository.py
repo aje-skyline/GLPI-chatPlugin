@@ -172,6 +172,7 @@ async def get_all_computers(
         fetched, dan truncated flag.
     """
     base_params: dict[str, Any] = {
+        "is_recursive": "true",
         "expand_dropdowns": "true",
         **_COMPUTER_SEARCH_FORCEDISPLAY,
     }
@@ -227,8 +228,8 @@ async def get_total_computers_count() -> int:
     """
     try:
         data = await glpi_get("/search/Computer", params={
-            "is_recursive": "1",
-            "range": "0-1",
+            "countonly": "true",
+            "is_recursive": "true",
         })
         if isinstance(data, dict) and "totalcount" in data:
             return int(data["totalcount"])
@@ -480,6 +481,7 @@ async def search_computer_by_name(name: str, limit: int = 50) -> list[dict[str, 
     """
     try:
         params: dict[str, Any] = {
+            "is_recursive":            "true",
             "criteria[0][field]":      1,
             "criteria[0][searchtype]": "contains",
             "criteria[0][value]":      name,
@@ -510,6 +512,7 @@ async def search_computer(query: str, limit: int = 10) -> list[dict[str, Any]]:
     """
     try:
         params: dict[str, Any] = {
+            "is_recursive":            "true",
             "criteria[0][field]":      1,
             "criteria[0][searchtype]": "contains",
             "criteria[0][value]":      query,
@@ -551,6 +554,7 @@ async def get_computers_by_status(
         truncated flag.
     """
     base_params: dict[str, Any] = {
+        "is_recursive":            "true",
         "criteria[0][field]":      31,
         "criteria[0][searchtype]": "contains",
         "criteria[0][value]":      status_filter,
@@ -590,6 +594,7 @@ async def get_computers_by_location(
         truncated flag.
     """
     base_params: dict[str, Any] = {
+        "is_recursive":            "true",
         "criteria[0][field]":      3,
         "criteria[0][searchtype]": "contains",
         "criteria[0][value]":      location_filter,
@@ -630,6 +635,7 @@ async def get_computers_by_os(
         truncated flag.
     """
     base_params: dict[str, Any] = {
+        "is_recursive":            "true",
         "criteria[0][field]":      14,
         "criteria[0][searchtype]": "contains",
         "criteria[0][value]":      os_filter,
