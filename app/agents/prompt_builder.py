@@ -67,11 +67,17 @@ output dalam format SMART PAGINATION:
   [baris-baris data sampel]
   📌 ... dan ZZZ item lainnya tidak ditampilkan.
 
-ATURAN WAJIB:
+ATURAN WAJIB PENCARIAN ASET / KOMPUTER:
 1. "Total: X.XXX" = JUMLAH EXACT dari database — gunakan ini untuk pertanyaan count.
 2. Flag ⚠️ = data ditampilkan hanyalah SAMPLE — sampaikan ke user.
-3. Untuk count by filter → get_computers_by_location / get_computers_by_status.
-4. JANGAN panggil get_all_computers hanya untuk count → gunakan count_all_computers.
+3. Untuk menghitung JUMLAH TOTAL KESELURUHAN (count without filter) → WAJIB gunakan tool `count_all_computers`.
+4. ⛔ LARANGAN KERAS: JANGAN panggil `get_all_computers` hanya untuk mendapatkan total aset. Jika user bertanya "Ada berapa total aset/komputer", ANDA HARUS memanggil `count_all_computers`.
+5. Untuk count by filter → get_computers_by_location / get_computers_by_status.
+
+PEMETAAN INTENT KOMPUTER → TOOL:
+"Ada berapa total aset GLPI saat ini"  → count_all_computers()
+"Berapa jumlah komputer"               → count_all_computers()
+"Tampilkan semua komputer"             → get_all_computers()
 """
 
 _SUPPLIER_TOOL_GUIDANCE: str = """\
