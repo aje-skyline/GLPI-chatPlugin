@@ -55,11 +55,12 @@ def _get_session_lock() -> asyncio.Lock:
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 async def _init_session() -> str:
-    """Buat session GLPI baru via ``GET /initSession``.
+    """Buat session GLPI baru via ``GET /initSession`` dan set Active Entities.
 
     Menggunakan ``glpi_user_token`` dari settings untuk autentikasi awal.
-    Setelah sukses, GLPI mengembalikan ``session_token`` yang dipakai untuk
-    semua request berikutnya.
+    Setelah sukses, session dikonfigurasi ke Root Entity (id: "all") secara
+    rekursif via ``POST /changeActiveEntities`` agar scope pencarian mencakup
+    seluruh aset.
 
     Returns:
         Session token string yang valid.
@@ -70,6 +71,8 @@ async def _init_session() -> str:
     """
     api_base = settings.glpi_api_url.rstrip("/")
     client = await get_http_client()
+    
+    # 1. Init Session
     resp = await client.get(
         f"{api_base}/initSession",
         headers={
@@ -85,7 +88,25 @@ async def _init_session() -> str:
             f"GLPI initSession berhasil (HTTP 200) tapi tidak mengembalikan "
             f"'session_token'. Response: {data}"
         )
-    logger.info("GLPI session initialized successfully")
+        
+    # 2. Change Active Entities to "all" with is_recursive=True
+    try:
+        ent_resp = await client.post(
+            f"{api_base}/changeActiveEntities",
+            headers={
+                **get_base_headers(),
+                "Session-Token": token,
+            },
+            json={
+                "entities_id": "all",
+                "is_recursive": True
+            }
+        )
+        ent_resp.raise_for_status()
+        logger.info("GLPI session initialized & entities scope set to 'all' (recursive)")
+    except Exception as exc:
+        logger.warning(f"Failed to change active entities to 'all': {exc}")
+        
     return token
 
 
