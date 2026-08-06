@@ -80,6 +80,8 @@ PEMETAAN INTENT ASET & KOMPUTER → TOOL:
 "Berapa jumlah aset"                   → count_all_assets()
 "Berapa jumlah komputer"               → count_all_computers()
 "Tampilkan semua komputer"             → get_all_computers()
+"Berapa total / jumlah X?"             → WAJIB panggil tool count_X()
+"Daftarkan / tampilkan X?"             → Panggil tool get_X()
 """
 
 _SUPPLIER_TOOL_GUIDANCE: str = """\
@@ -111,6 +113,8 @@ PEMETAAN INTENT → TOOL:
 "berikan detail supplier SYNNEX"       → get_suppliers(name="SYNNEX")
 "supplier yang alamatnya di Jakarta"   → get_suppliers(address="Jakarta")
 "berapa supplier + daftarnya"          → count_suppliers() LALU get_suppliers(limit=5)
+"Berapa total / jumlah X?"             → WAJIB panggil tool count_X()
+"Daftarkan / tampilkan X?"             → Panggil tool get_X()
 """
 
 _CONTRACT_TOOL_GUIDANCE: str = """
@@ -142,6 +146,8 @@ PEMETAAN INTENT → TOOL:
 "info kontrak maintenance server"         → list_all_contracts() → cari ID → get_contract_detail()
 "kontrak aktif milik PC-MARKETING-01"     → search_computer("PC-MARKETING-01") → list_all_contracts(computer_id=<id>, active_only=True)
 "berapa kontrak + daftarnya"              → list_all_contracts()
+"Berapa total / jumlah X?"                → WAJIB panggil tool count_X()
+"Daftarkan / tampilkan X?"                → Panggil tool get_X()
 """
 
 
