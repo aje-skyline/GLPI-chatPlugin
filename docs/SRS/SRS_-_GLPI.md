@@ -16,7 +16,7 @@ Pengembang
 
 **PT Semesta Teknologi Informatika (STI)**
 
-Versi Dokumen 3.0.0 | 03 Agustus 2026
+Versi Dokumen 3.1.0 | 11 Agustus 2026
 
 Status: Revised Final Draft Untuk Review & Persetujuan
 
@@ -49,16 +49,16 @@ Status: Revised Final Draft Untuk Review & Persetujuan
 </tr>
 <tr class="even">
 <td>Versi Dokumen</td>
-<td>3.0.0</td>
+<td>3.1.0</td>
 </tr>
 <tr class="odd">
 <td>Tanggal Pembuatan</td>
-<td>03 Agustus 2026</td>
+<td>11 Agustus 2026</td>
 </tr>
 <tr class="even">
 <td>Status Dokumen</td>
 <td><p>Revised Final Draft Untuk Review &amp; Persetujuan</p>
-<p><strong>Ringkasan Revisi:</strong> Penegasan sistem sebagai ekosistem dual-komponen yang terdiri dari Plugin GLPI (Frontend PHP) dan Engine FastAPI (Python Backend) berdasarkan implementasi saat ini. Penyimpanan histori persisten pada DB MySQL GLPI, serta implementasi 20 Tools Read-Only untuk kueri Data Center dan tiket GLPI.</p></td>
+<p><strong>Ringkasan Revisi:</strong> Penegasan sistem sebagai ekosistem dual-komponen yang terdiri dari Plugin GLPI (Frontend PHP) dan Engine FastAPI (Python Backend) berdasarkan implementasi saat ini. Penyimpanan histori persisten pada DB MySQL GLPI, serta implementasi 20 Tools Read-Only untuk kueri Data Center dan tiket GLPI. Penambahan spesifikasi fungsional terintegrasi untuk Microsoft SCCM sebagai source-of-truth manajemen aset, termasuk korelasi aset asinkron dan audit trail.</p></td>
 </tr>
 <tr class="odd">
 <td>Bahasa Antarmuka Sistem</td>
@@ -121,6 +121,9 @@ Secara arsitektur, Plugin bertindak sebagai antarmuka depan (*Client*) yang meng
 | Intent Routing Engine | Klasifikasi awal di FastAPI untuk mem-bypass agen kompleks saat pengguna hanya melontarkan sapaan santai (*casual chat*).                                                                   |
 | Read-Only Data Query  | Fasilitas agen (CrewAI) dengan 20 kumpulan *tools* untuk mengeksekusi pencarian data komputer, tiket, aset, dan kontrak GLPI secara aman.                                                   |
 | LLM Integration       | Eksekusi pembuatan kalimat yang terstruktur, alami, dan selalu dibatasi dalam Bahasa Indonesia (Anti-Hallucination).                                                                        |
+| SCCM Data Connector   | Fasilitas konektor hibrida (REST API / SQL Server) untuk menarik data histori utilisasi CPU, histori penggunaan memory, histori kapasitas dan penggunaan disk, histori uptime/performance perangkat, dan histori battery health untuk laptop dari SCCM.                                         |
+| Asset Correlator      | Fungsi *background task* asinkron untuk mencocokkan data aset antara GLPI dan SCCM guna menemukan inkonsistensi data.                                                                       |
+
 
 ## 2.3 Karakteristik Pengguna
 | **Role**             | **Deskripsi**                                                                          | **Akses Utama**                         |
@@ -135,6 +138,7 @@ Berikut adalah batasan yang berlaku untuk GLPI AI Chatbot Ecosystem:
 3.  **Kendala Bahasa**: Agen telah diinstruksikan (*system prompt*) untuk memberikan respon eksklusif dalam Bahasa Indonesia.
 4.  **Timeout**: Pemrosesan *chaining tools* oleh AI Engine akan dibatalkan (*hard timeout*) jika melampaui batas eksekusi 80 detik.
 5.  **Biaya Token API**: Sistem bergantung pada *rate-limit* eksternal dan API LLM pihak ketiga, biaya dan kapasitas sepenuhnya ditangani oleh klien (AHM).
+6.  **Otorisasi Data Eksternal**: Hak akses chatbot terhadap data SCCM dibatasi secara ketat pada kueri *read-only*. Chatbot tidak memiliki izin (*privilege*) untuk mengubah konfigurasi perangkat atau men-deploy *patch* melalui SCCM. Sistem mengasumsikan aturan *role-based access control* (RBAC) pada data SCCM mengikuti batasan dari akun *service* atau token API yang diberikan oleh klien.
 
 ## 2.5 Asumsi dan Ketergantungan
 1.  **Jaringan**: Diasumsikan server Plugin GLPI memiliki jalur komunikasi terbuka menuju server FastAPI Engine, dan API Engine dapat berkomunikasi kembali ke GLPI API Server lokal.
@@ -234,6 +238,19 @@ Modul ini mendefinisikan koleksi *Tools* yang tersedia bagi Agen AI.
 | FRGLP03 | Domain Kontrak & Supplier       | Tersedia 5 *Tools* untuk mencari direktori kontak rekanan pemasok (Supplier), daftar kontrak lisensi aktif, serta detail periode kontrak.                                                                                                                                                      | Agen AI        | Sedang        |
 | FRGLP04 | Automasi Sesi GLPI API          | *Tools* terhubung ke API GLPI dan berbagi sesi token tunggal yang dikelola menggunakan skema *Lazy Initialization* serta dapat diperbarui otomatis (*refresh*) saat menerima error 401.                                                                                                        | Sistem         | Tinggi        |
 
+
+## 4.4 Modul Integrasi SCCM & Korelasi Aset (FR-SCCM)
+Modul ini bertugas menangani aliran data antara sistem dan Microsoft SCCM, serta memastikan konsistensi data aset.
+
+| **ID**  | **Nama Kebutuhan** | **Deskripsi** | **Aktor** | **Prioritas** |
+|---------|--------------------|---------------|-----------|---------------|
+| FRSCC01 | Konektivitas Hibrida SCCM | Sistem menyediakan antarmuka penghubung (*connector*) yang mendukung dua metode untuk membaca data dari SCCM: (1) HTTP REST API dan (2) Direct SQL Query (via pymssql). Penggunaan metode disesuaikan dengan kapabilitas infrastruktur klien. | Sistem | Tinggi |
+| FRSCC02 | Agen Spesialis SCCM | Engine AI memiliki agen khusus (SCCM Infrastructure Specialist) yang memiliki kapabilitas memanggil *tools* untuk mengecek histori utilisasi CPU, histori penggunaan memory, histori kapasitas dan penggunaan disk, histori uptime/performance perangkat, dan histori battery health untuk laptop langsung dari SCCM. | AI Engine | Tinggi |
+| FRSCC03 | Orkestrasi Multi-Agen (Intent Routing) | Sistem menggunakan *Intent Router* untuk menentukan apakah pertanyaan pengguna ditujukan ke GLPI saja, SCCM saja, atau membutuhkan analisis perbandingan dari kedua sumber (*Joint Analysis*). | AI Engine | Tinggi |
+| FRSCC04 | Eksekusi Kueri *Read-Only* | Seluruh *tools* dan koneksi yang berinteraksi dengan SCCM secara mutlak dibatasi pada hak akses baca (*read-only*). Chatbot tidak memiliki izin untuk mengubah data di SCCM. | Sistem | Tinggi |
+| FRSCC05 | Background Task Korelasi Aset | Sistem memiliki *worker* asinkron (misal: Celery) yang membandingkan data aset (berdasarkan *Hostname*, *Serial Number*, atau *MAC Address*) secara massal antara GLPI dan SCCM untuk menemukan ketidakcocokan data (*mismatch*). | Sistem | Sedang |
+| FRSCC06 | Audit Trail Korelasi | Setiap proses korelasi aset dan persetujuan perubahan data akan dicatat secara persisten ke dalam sistem log audit untuk menjaga akuntabilitas. | Sistem | Sedang |
+
 # BAB 5 SPESIFIKASI REST API
 *Bab ini spesifik pada jembatan komunikasi antara Plugin PHP (Klien) dengan FastAPI Engine (Server)*.
 
@@ -242,7 +259,7 @@ Modul ini mendefinisikan koleksi *Tools* yang tersedia bagi Agen AI.
 | **Aspek**          | **Konvensi** |
 |--------------------|--------------|
 | Base URL           | Di-deploy di server mandiri: `http://<ip-engine>:8000/v1` |
-| Autentikasi        | `Authorization: Bearer <GATEWAY_API_KEY>` dari `.env` FastAPI. |
+| Autentikasi        | Pendekatan *Dual-Auth*: `Bearer <GATEWAY_API_KEY>` untuk obrolan AI, dan `Bearer <GLPI_PLUGIN_API_KEY>` untuk eksekusi API korelasi data SCCM. |
 | Format Data        | `Content-Type: application/json` |
 
 ## 5.2 API Utama: Chat Completions
@@ -305,5 +322,11 @@ Menyimpan baris percakapan individual agar tidak hilang saat browser ditutup.
 | `role`       | VARCHAR(20)   | `'user'` (pertanyaan) atau `'assistant'` (jawaban)|
 | `content`    | TEXT          | Isi percakapan (*payload* atau teks AI)           |
 | `created_at` | DATETIME      | Waktu pesan dicatat                               |
+
+
+## 6.2 Eksternal Persistence (FastAPI Engine)
+Walaupun Engine FastAPI tidak mengelola tabel GLPI secara langsung, modul *Asset Correlator* dan eksekusi integrasi SCCM memerlukan infrastruktur penyimpanan independen:
+1. **Redis**: Digunakan sebagai perantara pesan (*Message Broker*) dan penyimpan status pekerjaan asinkron (antrean Celery) dari korelasi aset.
+2. **SQLite (WAL Mode)**: Digunakan secara persisten untuk merekam jejak audit (*Audit Trail*) secara permanen atas tindakan pemicuan, persetujuan, atau penolakan hasil korelasi GLPI-SCCM.
 
 *(Catatan: Saat Plugin GLPI dilakukan proses Uninstall/Copot dari dasbor Administrator, kedua tabel ini akan secara otomatis di-Drop (hapus permanen).)*
