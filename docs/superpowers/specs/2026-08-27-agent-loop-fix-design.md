@@ -262,3 +262,12 @@ Juga pass `session_id` ke `run_crew_async()` di `_stream_crew_response()`.
 - Section 1: Hapus suffix `[INSTRUKSI SISTEM]` dari return string
 - Section 2: Kembalikan `max_iter=8`, hapus `max_execution_time`
 - Section 3: Hapus dua file baru, revert perubahan di 3 file existing
+
+---
+
+## Clarification: Scope `run_crew()` vs `run_crew_async()`
+
+Session-level count cache (Section 3) **hanya diterapkan ke `run_crew_async()`** (streaming path).  
+`run_crew()` (blocking path, dipakai non-streaming via `ConversationalFlow`) **tidak diubah** —  
+blocking path tidak menerima `session_id` dari `_stream_crew_response()` dan jarang dipakai  
+di production (non-streaming jarang digunakan). Dapat ditambahkan di iterasi berikutnya jika diperlukan.
