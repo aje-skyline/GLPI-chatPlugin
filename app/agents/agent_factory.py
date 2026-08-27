@@ -238,11 +238,14 @@ def build_it_support(llm: LLM, glpi_user_id: int = 0) -> Agent:  # noqa: ARG001
         llm=llm,
         verbose=settings.crew_verbose,
         allow_delegation=False,
-        # max_iter=8: v8.0 turun dari 15 → 8 untuk mengurangi latency.
-        # Dengan instruksi anti-loop yang kuat di backstory & task description,
-        # agent seharusnya selesai dalam 2-3 iterasi (1 tool call + Final Answer).
-        # 8 iterasi = safety net yang cukup untuk query legitimate yang butuh
-        # 2-3 tool call berbeda (count + list + detail).
-        max_iter=8,
+        # max_iter=5: Turun dari 8 → 5.
+        # Query sederhana (count/search) selesai 2 iter: tool call + Final Answer.
+        # Query kompleks (search → detail → compare) butuh maks 3-4 iter.
+        # 5 = safety net cukup tanpa risiko loop panjang.
+        max_iter=5,
         max_retry_limit=2,
+        # max_execution_time=55: Hard-stop 55s < server timeout 80s (main.py).
+        # Memberi buffer 25s untuk cleanup SSE + sentinel queue.
+        # CrewAI raise exception saat limit tercapai → ditangkap di crew_orchestrator.py.
+        max_execution_time=55,
     )
