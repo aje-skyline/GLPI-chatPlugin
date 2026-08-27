@@ -227,7 +227,7 @@ def _build_task_description(
       [KONTEKS SESI]          — user_id & jumlah pesan
       [RIWAYAT PERCAKAPAN]    — prior turns (opsional, hanya jika ada)
       [PERTANYAAN TERBARU]    — pertanyaan user saat ini
-      [Panduan Thought]       — aturan singkat untuk format Thought:
+      [Aturan Data Besar]     — aturan untuk data > 100 record:
       PANDUAN PENGERJAAN      — tool routing guide lengkap
       _LARGE_DATA_GUIDANCE    — panduan interpretasi data besar
       _SUPPLIER_TOOL_GUIDANCE — panduan khusus tool supplier
@@ -268,11 +268,6 @@ def _build_task_description(
 "{user_message}"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[Panduan Format Pemikiran (Thought Process)]
-WAJIB SINGKAT (Max 1-2 kalimat). Format:
-Thought: User ingin [X]. Saya akan memanggil tool [Y].
-(Lalu langsung Action. Setelah hasil tool → Final Answer TANPA thought lagi).
-
 ATURAN DATA BESAR:
 Jika hasil tool berisi "[INSTRUKSI SISTEM]" → TULIS Final Answer LANGSUNG.
 DILARANG panggil tool lagi. Sebut totalcount exact + 5 sampel saja.
