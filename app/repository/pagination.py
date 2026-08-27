@@ -44,12 +44,18 @@ konfigurasi GLPI tanpa modifikasi server. Naikkan ke 200-500 hanya jika
 server GLPI Anda sudah dikonfigurasi untuk mendukung range besar.
 """
 
-GLPI_AUTO_PAGINATE_LIMIT: int = 20_000
-"""Batas total record yang akan di-fetch melalui auto-pagination.
+STAT_FETCH_CAP: int = 500
+"""Batas maksimum record yang di-fetch via pagination untuk komputasi
+statistik distribusi (status/lokasi/OS).
 
-Di luar batas ini, hanya data yang sudah ter-fetch yang dikembalikan
-(dengan ``truncated=True``). Ini melindungi context window LLM dari
-overflow ketika GLPI menyimpan puluhan ribu record.
+totalcount exact SELALU didapat dari probe (Fase 1, 1 request) —
+tidak terpengaruh cap ini. Cap hanya membatasi berapa record
+di-fetch ke memori di Fase 2 untuk komputasi Counter di
+_build_summary_stats().
+
+Nilai 500 = ~5 page × 100 item, cukup representatif untuk
+distribusi top-5. Di luar batas ini, truncated=True dan
+scope_note di formatter menyertakan label sampel.
 """
 
 
@@ -105,7 +111,7 @@ async def get_all_pages(
     path: str,
     base_params: dict[str, Any],
     sample_size: int = 50,
-    max_total: int = GLPI_AUTO_PAGINATE_LIMIT,
+    max_total: int = STAT_FETCH_CAP,
     page_size: int = GLPI_MAX_PAGE_SIZE,
 ) -> PagedResult:
     """Ambil semua halaman dari GLPI Search API secara otomatis.
@@ -121,7 +127,7 @@ async def get_all_pages(
         sample_size: Jumlah record yang diambil di halaman pertama (probe).
                      Default 50 — cukup untuk sample tapi tidak terlalu besar.
         max_total  : Batas maksimum record yang di-fetch via pagination.
-                     Default ``GLPI_AUTO_PAGINATE_LIMIT`` (20.000).
+                     Default ``STAT_FETCH_CAP`` (500).
         page_size  : Jumlah record per halaman setelah probe.
                      Default ``GLPI_MAX_PAGE_SIZE`` (100).
 
@@ -191,6 +197,8 @@ async def get_all_pages(
             break
 
         items.extend(page_items)
+        if len(items) > max_total:
+            items = items[:max_total]
         logger.debug(
             "get_all_pages: fetched range %d-%d, total_so_far=%d",
             start, end, len(items),
