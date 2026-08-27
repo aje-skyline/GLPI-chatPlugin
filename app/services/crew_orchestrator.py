@@ -38,6 +38,7 @@ from openai import RateLimitError
 from app.agents.agent_factory import _get_agent
 from app.agents.prompt_builder import _build_task_description
 from app.utils import sanitize_agent_output
+from app.infrastructure.thread_context import set_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +250,7 @@ async def run_crew_async(
     glpi_user_id: int,
     messages: list[dict[str, str]] | None = None,
     step_queue: "asyncio.Queue[str | None] | None" = None,
+    session_id: str = "",
 ) -> str:
     """Jalankan Crew secara async menggunakan kickoff_async() + SSE streaming.
 
@@ -334,6 +336,11 @@ async def run_crew_async(
     try:
         # kickoff_async() internally calls asyncio.to_thread(self.kickoff)
         # sehingga tidak mem-block event loop FastAPI.
+        # Propagate session_id ke worker thread via ContextVar.
+        # ContextVar di-copy otomatis saat asyncio.to_thread() dipanggil
+        # oleh kickoff_async() — thread-local biasa TIDAK akan berfungsi.
+        set_session_id(session_id)
+        
         last_exc: Exception | None = None
         result: Any = None
         for attempt in range(_MAX_RETRIES):
@@ -363,6 +370,21 @@ async def run_crew_async(
         return clean_str
 
     except Exception as exc:
+        err_str = str(exc).lower()
+        # Deteksi timeout dari max_execution_time CrewAI sebelum generic handler.
+        # CrewAI bisa raise berbagai exception type saat time limit tercapai.
+        if any(kw in err_str for kw in (
+            "timeout", "timed out", "execution time", "max_execution",
+            "time limit", "took too long",
+        )):
+            logger.warning(
+                "Crew execution time limit reached for session=%s: %s",
+                session_id[:20], exc,
+            )
+            return (
+                "Sistem membutuhkan waktu lebih lama dari biasanya untuk memproses "
+                "permintaan ini. Silakan coba ulangi pertanyaan Anda."
+            )
         logger.error("Crew async execution failed: %s", exc, exc_info=True)
         return (
             "Mohon maaf, sistem sedang mengalami kendala teknis. "
