@@ -106,7 +106,6 @@ _TOOLS: list[Any] = [
     tool_get_all_computers,
     tool_get_computer_detail,
     tool_count_all_assets,
-    tool_count_all_assets,
     tool_count_all_computers,
     # Computer — searching
     tool_search_computer_by_name,
