@@ -19,6 +19,7 @@ from typing import Any, AsyncGenerator
 from contextlib import asynccontextmanager
 from app.infrastructure import close_http_client
 from app.cache import cache_clear # Menggantikan invalidate_static_cache yang lama
+from app.cache_count import clear_expired as clear_count_cache
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -223,7 +224,7 @@ async def _stream_crew_response(
     # run_crew_async() menggunakan kickoff_async() → asyncio.to_thread() secara
     # internal — event loop FastAPI TIDAK ter-block selama crew berjalan.
     crew_task = asyncio.create_task(
-        run_crew_async(user_message, glpi_user_id, messages, step_queue)
+        run_crew_async(user_message, glpi_user_id, messages, step_queue, session_id)
     )
 
     status_cycle = [
@@ -336,6 +337,7 @@ async def _session_cleanup_loop() -> None:
     while True:
         await asyncio.sleep(60)
         _clean_sessions()
+        clear_count_cache()  # bersihkan count cache expired setiap 60 detik
 
 
 @asynccontextmanager
