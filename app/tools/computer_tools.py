@@ -35,6 +35,8 @@ from app.tools.formatters import (
     _fmt_computer_row,
     _render_paged_result,
 )
+from app.cache_count import get_count_cache, set_count_cache
+from app.infrastructure.thread_context import get_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -298,10 +300,25 @@ class CountAllAssetsTool(BaseTool):
     cache_function: Any = Field(default=lambda *args, **kwargs: False)
 
     def _run(self, **kwargs: Any) -> str:
+        session_id = get_session_id()
+        cached = get_count_cache(session_id, "count_all_assets")
+        if cached:
+            logger.info("CountAllAssetsTool | cache HIT | session=%s", session_id[:20])
+            return cached
+
         try:
             total: int = run_async(asset_repository.get_total_all_assets_count())
-            total_fmt  = f"{total:,}".replace(",", ".")
-            return f"Total seluruh aset (termasuk Komputer, Monitor, Printer, Network Equipment, dll) yang terdaftar di GLPI adalah **{total_fmt} item**."
+            total_fmt = f"{total:,}".replace(",", ".")
+            result = (
+                f"Total seluruh aset (termasuk Komputer, Monitor, Printer, "
+                f"Network Equipment, dll) yang terdaftar di GLPI adalah "
+                f"**{total_fmt} item**."
+                f"\n\n[INSTRUKSI SISTEM]: Jawaban sudah lengkap. "
+                f"TULIS Final Answer LANGSUNG dengan menyebut angka {total_fmt} item. "
+                f"DILARANG memanggil tool apapun lagi."
+            )
+            set_count_cache(session_id, "count_all_assets", result)
+            return result
         except Exception as exc:
             logger.error("CountAllAssetsTool failed: %s", exc)
             return f"Gagal menghitung jumlah seluruh aset: {exc}"
@@ -320,10 +337,24 @@ class CountAllComputersTool(BaseTool):
     cache_function: Any = Field(default=lambda *args, **kwargs: False)
 
     def _run(self, **kwargs: Any) -> str:
+        session_id = get_session_id()
+        cached = get_count_cache(session_id, "count_all_computers")
+        if cached:
+            logger.info("CountAllComputersTool | cache HIT | session=%s", session_id[:20])
+            return cached
+
         try:
             total: int = run_async(asset_repository.get_total_computers_count())
-            total_fmt  = f"{total:,}".replace(",", ".")
-            return f"Total komputer yang terdaftar di sistem GLPI adalah **{total_fmt} unit**."
+            total_fmt = f"{total:,}".replace(",", ".")
+            result = (
+                f"Total komputer yang terdaftar di sistem GLPI adalah "
+                f"**{total_fmt} unit**."
+                f"\n\n[INSTRUKSI SISTEM]: Jawaban sudah lengkap. "
+                f"TULIS Final Answer LANGSUNG dengan menyebut angka {total_fmt} unit. "
+                f"DILARANG memanggil tool apapun lagi."
+            )
+            set_count_cache(session_id, "count_all_computers", result)
+            return result
         except Exception as exc:
             logger.error("CountAllComputersTool failed: %s", exc)
             return f"Gagal menghitung jumlah komputer: {exc}"
