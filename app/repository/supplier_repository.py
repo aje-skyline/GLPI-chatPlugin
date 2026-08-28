@@ -181,7 +181,8 @@ async def count_suppliers() -> int:
     
     params = { 
         "countonly": "true", 
-        "is_recursive": "true"
+        "is_recursive": "true",
+        "is_deleted": "0"
     } 
     
     try: 

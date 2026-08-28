@@ -230,6 +230,7 @@ async def get_total_all_assets_count() -> int:
         data = await glpi_get("/search/AllAssets", params={
             "countonly": "true",
             "is_recursive": "true",
+            "is_deleted": "0"
         })
         if isinstance(data, dict) and "totalcount" in data:
             return int(data["totalcount"])
@@ -249,8 +250,12 @@ async def get_total_computers_count() -> int:
     """
     try:
         data = await glpi_get("/search/Computer", params={
-            "countonly": "true",
+            "is_deleted": "0",
             "is_recursive": "true",
+            "countonly": "true",
+            "criteria[0][field]": 1,
+            "criteria[0][searchtype]": "contains",
+            "criteria[0][value]": ""
         })
         if isinstance(data, dict) and "totalcount" in data:
             return int(data["totalcount"])
