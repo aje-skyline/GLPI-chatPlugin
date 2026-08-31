@@ -204,13 +204,13 @@ class GetAllComputersTool(BaseTool):
 
     name: str = "get_all_computers"
     description: str = (
-        "Ambil daftar SEMUA komputer di inventaris GLPI. "
-        "Selalu mengembalikan JUMLAH EXACT total komputer (totalcount dari API), "
-        "plus summary statistik (distribusi status/lokasi/OS) jika data > 100, "
-        "plus sample data sebagai representasi. "
-        "JANGAN gunakan untuk mencari by nama/serial — gunakan search_computer. "
-        "JANGAN gunakan untuk aset milik user tertentu — gunakan get_user_assets. "
-        "Daftar/cari item di GLPI. ⛔ DILARANG KERAS menggunakan tool ini hanya untuk menghitung total/jumlah item! Jika user bertanya 'ada berapa' atau 'total', Anda WAJIB menggunakan tool count_*."
+        "Ambil daftar SEMUA komputer di inventaris GLPI beserta sample data. "
+        "HANYA gunakan saat user meminta DAFTAR atau LIST komputer — bukan untuk COUNT. "
+        "⛔ DILARANG KERAS menggunakan tool ini untuk pertanyaan 'berapa', 'jumlah', "
+        "'total', 'summary', 'ringkasan', atau 'ada berapa' — "
+        "gunakan count_all_computers untuk itu. "
+        "⛔ DILARANG untuk mencari by nama/serial — gunakan search_computer. "
+        "⛔ DILARANG untuk aset milik user tertentu — gunakan get_user_assets."
     )
     args_schema: Type[BaseModel] = GetAllComputersInput
     # Cache aktif: inventaris tidak berubah dalam hitungan detik; mencegah
