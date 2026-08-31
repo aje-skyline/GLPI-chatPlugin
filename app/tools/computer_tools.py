@@ -200,7 +200,7 @@ class GetUserAssetsTool(BaseTool):
 
 
 class GetAllComputersTool(BaseTool):
-    """Ambil semua komputer di GLPI dengan jumlah exact dan summary statistik."""
+    """Ambil daftar komputer di GLPI beserta sample data. Gunakan hanya untuk listing, bukan counting."""
 
     name: str = "get_all_computers"
     description: str = (
