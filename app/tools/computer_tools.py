@@ -84,10 +84,6 @@ class GetComputerDetailInput(BaseModel):
     )
 
 
-
-
-
-
 class SearchComputerByNameInput(BaseModel):
     name: str = Field(
         ...,
