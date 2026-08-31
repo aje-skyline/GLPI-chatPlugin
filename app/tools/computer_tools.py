@@ -84,11 +84,7 @@ class GetComputerDetailInput(BaseModel):
     )
 
 
-class CountAllComputersInput(BaseModel):
-    call_id: str = Field(default="", exclude=True)
 
-class CountAllAssetsInput(BaseModel):
-    call_id: str = Field(default="", exclude=True)
 
 
 
@@ -296,10 +292,9 @@ class CountAllAssetsTool(BaseTool):
         "Gunakan HANYA jika ditanya 'ada berapa total aset', 'jumlah aset', atau 'total aset' secara umum. "
         "Jika ditanya jumlah KOMPUTER saja, gunakan count_all_computers."
     )
-    args_schema: Type[BaseModel] = CountAllAssetsInput
     cache_function: Any = Field(default=lambda *args, **kwargs: False)
 
-    def _run(self, **kwargs: Any) -> str:
+    def _run(self) -> str:
         session_id = get_session_id()
         cached = get_count_cache(session_id, "count_all_assets")
         if cached:
@@ -333,10 +328,9 @@ class CountAllComputersTool(BaseTool):
         "Gunakan HANYA jika ditanya 'ada berapa', 'jumlah', atau 'total' komputer. "
         "Lebih cepat dari get_all_computers karena hanya mengambil count, bukan data."
     )
-    args_schema: Type[BaseModel] = CountAllComputersInput
     cache_function: Any = Field(default=lambda *args, **kwargs: False)
 
-    def _run(self, **kwargs: Any) -> str:
+    def _run(self) -> str:
         session_id = get_session_id()
         cached = get_count_cache(session_id, "count_all_computers")
         if cached:
