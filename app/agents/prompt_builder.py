@@ -75,6 +75,12 @@ ATURAN WAJIB PENCARIAN ASET / KOMPUTER:
 5. ⛔ LARANGAN KERAS: JANGAN panggil `get_all_computers` hanya untuk mendapatkan total aset. 
 6. Untuk count by filter → get_computers_by_location / get_computers_by_status.
 
+FORMAT OUTPUT KOMPUTER:
+Gunakan TABEL MARKDOWN untuk daftar komputer:
+| ID | Nama | Serial | OS | Lokasi | Status |
+|---|---|---|---|---|---|
+Jangan gunakan bullet list untuk data tabular.
+
 PEMETAAN INTENT ASET & KOMPUTER → TOOL:
 "Ada berapa total aset GLPI saat ini"  → count_all_assets()
 "Berapa jumlah aset"                   → count_all_assets()
@@ -107,6 +113,12 @@ ATURAN WAJIB UNTUK "DAFTAR SEMUA" / "TAMPILKAN SEMUA SUPPLIER":
    (kecuali filter berbeda karena user meminta supplier spesifik).
    Looping tool untuk pagination = TIMEOUT SISTEM → user tidak mendapat jawaban.
 
+FORMAT OUTPUT SUPPLIER:
+Gunakan TABEL MARKDOWN untuk daftar supplier:
+| ID | Nama | Entity | Alamat | Telepon |
+|---|---|---|---|---|
+Jangan gunakan bullet list untuk data tabular.
+
 PEMETAAN INTENT → TOOL:
 "ada berapa total supplier?"           → count_suppliers()
 "daftar semua supplier"                → get_suppliers(limit=5) — SEKALI SAJA
@@ -136,6 +148,12 @@ ATURAN WAJIB UNTUK "DAFTAR SEMUA" / "TAMPILKAN SEMUA KONTRAK":
 ⛔ LARANGAN KERAS: Memanggil list_all_contracts lebih dari SATU KALI per pertanyaan
    (kecuali filter berbeda karena user meminta kontrak spesifik).
    Looping tool untuk pagination = TIMEOUT SISTEM → user tidak mendapat jawaban.
+
+FORMAT OUTPUT KONTRAK:
+Gunakan TABEL MARKDOWN untuk daftar kontrak:
+| ID | Nama | Nomor | Tipe | Status |
+|---|---|---|---|---|
+Jangan gunakan bullet list untuk data tabular.
 
 PEMETAAN INTENT → TOOL:
 "ada berapa kontrak?"                     → count_contracts()
@@ -385,6 +403,15 @@ PANDUAN PENGERJAAN:
 {_select_guidance(user_message)}
 
 4. Final Answer: Bahasa Indonesia, sopan, NO JSON/Thought/Action tags.
+   FORMAT OUTPUT (WAJIB):
+   • Jika data berbentuk list/daftar → gunakan TABEL MARKDOWN.
+   • Kolom: sesuaikan dengan tipe data (ID, Nama, Status, Tanggal, dll).
+   • Contoh tabel:
+     | ID | Nama Kontrak | Nomor | Tipe |
+     |---|---|---|---|
+     | 1 | CATIA | 010/AHMIDE-NSI/III-2018 | Software Assurance |
+   • Gunakan bullet list hanya untuk penjelasan/ringkasan non-tabular.
+   • Code block untuk error message/log/output teknis.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
 
