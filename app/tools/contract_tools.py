@@ -62,6 +62,43 @@ _PAGINATION_THRESHOLD: int = 10
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Field Formatters
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fmt_months(value: Any) -> str:
+    """Format durasi/notice GLPI (integer bulan) menjadi teks eksplisit.
+
+    GLPI menyimpan duration dan notice sebagai integer bulan, dengan 0 berarti
+    "tidak ditentukan". Menampilkan "0" mentah membuat LLM menebak satuannya,
+    jadi satuan ditulis eksplisit agar tidak perlu diinterpretasi.
+    """
+    if value in (None, "", 0, "0"):
+        return "-"
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{n} bulan"
+
+
+def _fmt_cost(value: Any) -> str:
+    """Format biaya kontrak GLPI sebagai Rupiah dengan pemisah ribuan.
+
+    GLPI mengembalikan cost sebagai string/float (mis. "15000000.0000").
+    Tanpa format, LLM sering menyalinnya apa adanya termasuk desimal nol.
+    """
+    if value in (None, "", 0, "0"):
+        return "-"
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if amount == 0:
+        return "-"
+    return f"Rp {amount:,.0f}".replace(",", ".")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Input Schemas
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -164,23 +201,50 @@ class GetContractsTool(BaseTool):
                     return "Tidak ada kontrak aktif ditemukan."
 
             output = f"Total: {total_count} kontrak ditemukan di GLPI.\n"
-            output += f"Menampilkan {len(results)} sampel terbaru:\n\n"  # ← fix: len() bukan le()
+            # CATATAN: total_count berasal dari count_contracts() (seluruh DB),
+            # sedangkan results sudah dibatasi limit DAN mungkin difilter
+            # active_only/computer_id. Keduanya TIDAK sebanding — karena itu
+            # label dibedakan agar LLM tidak menyimpulkan "total = 5".
+            if active_only or computer_id:
+                output += f"Menampilkan {len(results)} kontrak hasil filter:\n\n"
+            else:
+                output += f"Menampilkan {len(results)} sampel pertama:\n\n"
 
+            # Field ditampilkan dengan label eksplisit dan satu field per baris.
+            # Format satu-baris-padat sebelumnya membuat LLM salah menafsirkan
+            # kolom dan berhalusinasi label seperti "Komputer ID 1".
             for c in results:
-                output += (
-                f"• **{c.get('name') or '-'}** (ID: {c.get('id') or '-'}) "f"No: {c.get('num') or '-'} | Sup: {c.get('supplier') or '-'} | Ent: {c.get('entity') or '-'} | Biaya: {c.get('cost') or '-'} | Berakhir:{c.get('end_date') or '-'}\n"
-                )
+                output += f"• Name          : {c.get('name') or '-'}\n"
+                output += f"  Type          : {c.get('type') or '-'}\n"
+                output += f"  Number        : {c.get('num') or '-'}\n"
+                output += f"  Start Date    : {c.get('begin_date') or '-'}\n"
+                output += f"  Duration      : {_fmt_months(c.get('duration'))}\n"
+                output += f"  Notice        : {_fmt_months(c.get('notice'))}\n"
+                output += f"  Cost-Total    : {_fmt_cost(c.get('cost'))}\n"
+                output += f"  (Contract ID  : {c.get('id') or '-'})\n\n"
 
-            # Sisipkan flag Smart Pagination jika data di-truncate
+            # Sisipkan flag Smart Pagination HANYA jika data benar-benar dipotong.
+            # Sebelumnya ada dua blok [INSTRUKSI SISTEM]: satu kondisional dan
+            # satu tanpa syarat. Blok tanpa syarat membuat tool mengklaim data
+            # adalah "SAMPLE" bahkan saat seluruh kontrak sudah ditampilkan,
+            # sehingga LLM menambahkan disclaimer palsu.
             if total_count > len(results):
                 output += "\n**[INSTRUKSI SISTEM — WAJIB DIIKUTI]**\n"
-                output += f"Terdapat total {total_count} kontrak. Data di atas hanya sampel.\n"
+                output += (
+                    f"Data di atas hanya {len(results)} sampel. Total exact di "
+                    f"database adalah {total_count} kontrak — gunakan angka ini, "
+                    f"JANGAN hitung jumlah baris di atas.\n"
+                )
                 output += (
                     "JANGAN panggil tool lagi. Beritahu user jumlah total dan sampaikan "
                     "jika ingin mencari kontrak spesifik silakan sebutkan nama atau ID-nya."
                 )
-            
-            output += f"\n\n[INSTRUKSI SISTEM]: Data di atas adalah SAMPLE. Total exact di database adalah {total_count}. Tulis Final Answer langsung dari angka total ini dan JANGAN hitung jumlah baris di atas."
+            else:
+                output += (
+                    "\n[INSTRUKSI SISTEM]: Seluruh data sudah ditampilkan lengkap "
+                    "(bukan sampel). JANGAN panggil tool lagi dan JANGAN menyebut "
+                    "data ini sebagai sampel."
+                )
 
             return output
 
@@ -207,16 +271,19 @@ class GetContractDetailTool(BaseTool):
             if not c:
                 return f"Kontrak dengan ID {contract_id} tidak ditemukan di GLPI."
 
+            # Urutan & label konsisten dengan list_all_contracts agar LLM
+            # tidak perlu memetakan dua skema berbeda.
             output  = f"Detail Kontrak (ID: {contract_id}):\n\n"
-            output += f"  Nama     : {c.get('name')       or '-'}\n"
-            output += f"  Nomor    : {c.get('num')        or '(tidak ada)'}\n"
-            output += f"  Supplier : {c.get('supplier')   or '(tidak ada)'}\n"
-            output += f"  Entitas  : {c.get('entity')     or '(tidak ada)'}\n"
-            output += f"  Biaya    : {c.get('cost')       or '(tidak ada)'}\n"
-            output += f"  Tipe     : {c.get('type')       or '(tidak ada)'}\n"
-            output += f"  Mulai    : {c.get('begin_date') or '(tidak ada)'}\n"
-            output += f"  Durasi   : {c.get('duration')   or '(tidak ada)'} bulan\n"
-            output += f"  Berakhir : {c.get('end_date')   or '(tidak ada)'}\n"
+            output += f"  Name          : {c.get('name') or '-'}\n"
+            output += f"  Type          : {c.get('type') or '-'}\n"
+            output += f"  Number        : {c.get('num')  or '-'}\n"
+            output += f"  Start Date    : {c.get('begin_date') or '-'}\n"
+            output += f"  Duration      : {_fmt_months(c.get('duration'))}\n"
+            output += f"  Notice        : {_fmt_months(c.get('notice'))}\n"
+            output += f"  Cost-Total    : {_fmt_cost(c.get('cost'))}\n"
+            output += f"  End Date      : {c.get('end_date') or '-'}\n"
+            output += f"  Supplier      : {c.get('supplier') or '-'}\n"
+            output += f"  Entity        : {c.get('entity') or '-'}\n"
             if c.get("comment"):
                 output += f"  Catatan  : {c['comment']}\n"
             return output

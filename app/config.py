@@ -58,6 +58,23 @@ class Settings(BaseSettings):
     # ── Session store ──────────────────────────────────────────────────────────
     session_ttl_minutes: int = 60
 
+    # ── Timeout & retry budget ─────────────────────────────────────────────────
+    # Ketiga nilai ini SALING TERKAIT dan harus menjaga invariant:
+    #
+    #     agent_max_execution_time_s < server_timeout_s < client timeout (120s)
+    #
+    # server_timeout_s      : batas SSE generator di main.py membatalkan crew.
+    # agent_max_execution_time_s : hard-stop CrewAI Agent (agent_factory.py).
+    #                         Harus lebih kecil dari server_timeout_s agar Agent
+    #                         berhenti sendiri sebelum server menyerah.
+    # retry_backoff_s       : jeda antar attempt saat 429 rate-limit.
+    #                         Total backoff HARUS jauh di bawah server_timeout_s,
+    #                         jika tidak retry dijamin ter-cancel sebelum selesai
+    #                         (bug v3.0: backoff 5+10+20=35s tidak pernah muat).
+    server_timeout_s: int = 80
+    agent_max_execution_time_s: int = 55
+    retry_backoff_s: tuple[float, ...] = (2.0, 4.0)
+
     model_config = {"env_file": ".env"}
 
     @property

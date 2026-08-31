@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import threading
 import time
 from typing import Any, Callable, TypeVar
 
@@ -37,6 +38,7 @@ from openai import RateLimitError
 
 from app.agents.agent_factory import _get_agent
 from app.agents.prompt_builder import _build_task_description
+from app.config import settings
 from app.utils import sanitize_agent_output
 from app.infrastructure.thread_context import set_session_id
 
@@ -44,29 +46,146 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# Retry config untuk 429 rate-limit
-_MAX_RETRIES: int = 3
-_RETRY_BACKOFF: tuple[float, ...] = (5.0, 10.0, 20.0)
+# Retry config untuk 429 rate-limit.
+# Backoff dibaca dari settings agar invariant terhadap server_timeout_s
+# terdokumentasi di satu tempat (app/config.py).
+_RETRY_BACKOFF: tuple[float, ...] = tuple(settings.retry_backoff_s)
+_MAX_RETRIES: int = len(_RETRY_BACKOFF) + 1
+
+# Pesan user-facing dibedakan agar 429 tidak salah dilaporkan sebagai timeout.
+MSG_RATE_LIMIT: str = (
+    "Sistem AI sedang menerima banyak permintaan sekaligus. "
+    "Mohon tunggu sebentar lalu kirim ulang pertanyaan Anda."
+)
+MSG_TIMEOUT: str = (
+    "Sistem membutuhkan waktu lebih lama dari biasanya untuk memproses "
+    "permintaan ini. Silakan coba ulangi pertanyaan Anda."
+)
+MSG_GENERIC: str = (
+    "Mohon maaf, sistem sedang mengalami kendala teknis. "
+    "Silakan coba beberapa saat lagi."
+)
 
 
-def _retry_on_rate_limit(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-    """Execute func dengan retry exponential backoff saat 429 rate-limit."""
-    last_exc: Exception | None = None
+class RateLimitExhausted(Exception):
+    """429 masih terjadi setelah seluruh budget retry habis."""
+
+
+def _next_backoff(attempt: int, deadline: float | None) -> float | None:
+    """Hitung jeda backoff untuk attempt berikutnya, atau None jika tidak muat.
+
+    Mengembalikan None ketika:
+      - attempt sudah mencapai batas maksimum, ATAU
+      - menunggu selama backoff akan melewati `deadline`, sehingga retry
+        dijamin ter-cancel oleh server timeout sebelum menghasilkan apa pun.
+
+    Ini adalah inti perbaikan bug v3.0: sebelumnya backoff 5+10+20=35s
+    selalu menabrak server timeout 80s, membuat retry menjadi dead code
+    yang justru memperlambat kegagalan.
+
+    Args:
+        attempt  : Index attempt yang baru saja gagal (0-based).
+        deadline : monotonic timestamp batas akhir, atau None = tanpa batas.
+
+    Returns:
+        Durasi tidur dalam detik, atau None jika retry harus dibatalkan.
+    """
+    if attempt >= len(_RETRY_BACKOFF):
+        return None
+
+    wait = _RETRY_BACKOFF[attempt]
+    if deadline is None:
+        return wait
+
+    remaining = deadline - time.monotonic()
+    # Butuh ruang untuk backoff + minimal satu round-trip LLM (~10s).
+    if remaining - wait < 10.0:
+        logger.warning(
+            "Skipping 429 retry: hanya %.1fs tersisa dari budget, "
+            "tidak cukup untuk backoff %.1fs + LLM call.",
+            max(0.0, remaining), wait,
+        )
+        return None
+    return wait
+
+
+def _retry_on_rate_limit(
+    func: Callable[..., T],
+    *args: Any,
+    deadline: float | None = None,
+    **kwargs: Any,
+) -> T:
+    """Execute func dengan retry backoff saat 429, sadar akan sisa waktu.
+
+    Args:
+        func     : Callable blocking yang akan dieksekusi.
+        deadline : monotonic timestamp batas akhir. Retry dilewati jika
+                   backoff tidak akan muat sebelum deadline.
+
+    Raises:
+        RateLimitExhausted : 429 persisten setelah budget retry habis.
+    """
     for attempt in range(_MAX_RETRIES):
         try:
             return func(*args, **kwargs)
         except RateLimitError as exc:
-            last_exc = exc
-            if attempt < _MAX_RETRIES - 1:
-                wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
-                logger.warning(
-                    "Rate limit hit (attempt %d/%d), retrying in %.1fs…",
-                    attempt + 1,
-                    _MAX_RETRIES,
-                    wait,
-                )
-                time.sleep(wait)
-    raise last_exc  # type: ignore[misc]
+            wait = _next_backoff(attempt, deadline)
+            if wait is None:
+                raise RateLimitExhausted(str(exc)) from exc
+            logger.warning(
+                "Rate limit hit (attempt %d/%d), retrying in %.1fs…",
+                attempt + 1, _MAX_RETRIES, wait,
+            )
+            time.sleep(wait)
+    raise RateLimitExhausted("retry budget habis")  # pragma: no cover
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Cooperative Cancellation
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CrewAborted(Exception):
+    """Di-raise di dalam worker thread CrewAI untuk menghentikan eksekusi.
+
+    Dipakai oleh mekanisme cooperative cancel: `crew_task.cancel()` TIDAK
+    dapat menghentikan thread yang dijalankan `asyncio.to_thread()` di dalam
+    `kickoff_async()`. Thread akan terus memanggil LLM meskipun client sudah
+    menyerah — menghabiskan kuota rate-limit untuk request berikutnya dan
+    memicu 429 berantai.
+
+    Solusinya: step_callback (satu-satunya hook CrewAI yang dieksekusi di
+    worker thread pada setiap batas iterasi agent) memeriksa Event abort dan
+    raise exception ini. CrewAI mem-propagate exception dari callback,
+    sehingga kickoff() berhenti dan thread selesai.
+
+    BATASAN PENTING:
+      Pembatalan hanya terjadi pada BATAS ITERASI. Satu panggilan LLM atau
+      tool yang sedang berjalan akan tetap diselesaikan lebih dulu. Ini juga
+      alasan `agent_max_execution_time_s` (55s) tetap diperlukan sebagai
+      lapis pertahanan kedua di level CrewAI.
+    """
+
+
+class AbortSignal:
+    """Handle thread-safe untuk membatalkan crew yang sedang berjalan."""
+
+    __slots__ = ("_event",)
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def abort(self) -> None:
+        """Minta crew berhenti (dipanggil dari event loop)."""
+        self._event.set()
+
+    @property
+    def aborted(self) -> bool:
+        return self._event.is_set()
+
+    def raise_if_aborted(self) -> None:
+        """Raise CrewAborted jika sudah dibatalkan (dipanggil dari worker thread)."""
+        if self._event.is_set():
+            raise CrewAborted("crew dibatalkan oleh server timeout")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -223,7 +342,10 @@ def run_crew(
     )
 
     try:
-        result: Any  = _retry_on_rate_limit(crew.kickoff)
+        result: Any  = _retry_on_rate_limit(
+            crew.kickoff,
+            deadline=time.monotonic() + settings.server_timeout_s,
+        )
         clean_str    = sanitize_agent_output(str(result))
 
         logger.info(
@@ -233,12 +355,17 @@ def run_crew(
         )
         return clean_str
 
+    except (RateLimitExhausted, RateLimitError) as exc:
+        logger.warning("Rate limit persisted after retries: %s", exc)
+        return MSG_RATE_LIMIT
+
     except Exception as exc:
+        err_str = str(exc).lower()
+        if "rate limit" in err_str or "429" in err_str:
+            logger.warning("Rate limit (detected via message): %s", exc)
+            return MSG_RATE_LIMIT
         logger.error("Crew execution failed: %s", exc, exc_info=True)
-        return (
-            "Mohon maaf, sistem sedang mengalami kendala teknis. "
-            "Silakan coba beberapa saat lagi."
-        )
+        return MSG_GENERIC
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -251,6 +378,7 @@ async def run_crew_async(
     messages: list[dict[str, str]] | None = None,
     step_queue: "asyncio.Queue[str | None] | None" = None,
     session_id: str = "",
+    abort: "AbortSignal | None" = None,
 ) -> str:
     """Jalankan Crew secara async menggunakan kickoff_async() + SSE streaming.
 
@@ -301,16 +429,24 @@ async def run_crew_async(
     # ── Bangun step_callback jika step_queue tersedia ─────────────────────────
     # PENTING: step_callback dipanggil dari worker thread CrewAI (bukan event loop).
     # Gunakan run_coroutine_threadsafe() — BUKAN await — untuk push ke queue.
+    # step_callback dipasang jika ADA step_queue ATAU ada abort signal —
+    # callback adalah satu-satunya hook yang berjalan di worker thread, jadi
+    # ia juga menjadi titik pemeriksaan pembatalan (lihat CrewAborted).
     step_callback_fn: Any = None
-    if step_queue is not None:
+    if step_queue is not None or abort is not None:
         loop = asyncio.get_running_loop()
+        _queue = step_queue
 
         def _step_callback(step_output: Any) -> None:
+            # Periksa abort LEBIH DULU: jika server sudah menyerah, hentikan
+            # thread sekarang alih-alih mengirim thought yang tak akan dibaca.
+            if abort is not None:
+                abort.raise_if_aborted()
+            if _queue is None:
+                return
             text = _extract_step_text(step_output)
             if text:
-                asyncio.run_coroutine_threadsafe(
-                    step_queue.put(text), loop
-                )
+                asyncio.run_coroutine_threadsafe(_queue.put(text), loop)
 
         step_callback_fn = _step_callback
 
@@ -340,26 +476,29 @@ async def run_crew_async(
         # ContextVar di-copy otomatis saat asyncio.to_thread() dipanggil
         # oleh kickoff_async() — thread-local biasa TIDAK akan berfungsi.
         set_session_id(session_id)
-        
-        last_exc: Exception | None = None
+
+        # Deadline retry: seluruh eksekusi (termasuk backoff) harus selesai
+        # sebelum server timeout, jika tidak retry hanya memperlambat kegagalan.
+        deadline = time.monotonic() + settings.server_timeout_s
+
         result: Any = None
         for attempt in range(_MAX_RETRIES):
             try:
                 result = await crew.kickoff_async()
                 break
             except RateLimitError as exc:
-                last_exc = exc
-                if attempt < _MAX_RETRIES - 1:
-                    wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
-                    logger.warning(
-                        "Rate limit hit (attempt %d/%d), retrying in %.1fs…",
-                        attempt + 1,
-                        _MAX_RETRIES,
-                        wait,
-                    )
-                    await asyncio.sleep(wait)
-        if result is None and last_exc is not None:
-            raise last_exc
+                wait = _next_backoff(attempt, deadline)
+                if wait is None:
+                    raise RateLimitExhausted(str(exc)) from exc
+                logger.warning(
+                    "Rate limit hit (attempt %d/%d), retrying in %.1fs…",
+                    attempt + 1, _MAX_RETRIES, wait,
+                )
+                await asyncio.sleep(wait)
+                # Jangan mulai attempt baru jika server sudah menyerah.
+                if abort is not None and abort.aborted:
+                    raise CrewAborted("dibatalkan saat backoff 429")
+
         clean_str   = sanitize_agent_output(str(result))
 
         logger.info(
@@ -368,6 +507,25 @@ async def run_crew_async(
             clean_str,
         )
         return clean_str
+
+    except CrewAborted:
+        # Pembatalan yang disengaja — worker thread berhasil dihentikan.
+        # Bukan error: tidak perlu stack trace, dan pesan tidak akan dikirim
+        # karena generator SSE sudah return saat memicu abort.
+        logger.info(
+            "Crew async aborted cleanly for session=%s (server timeout)",
+            session_id[:20],
+        )
+        return MSG_TIMEOUT
+
+    except (RateLimitExhausted, RateLimitError) as exc:
+        # Dibedakan dari timeout: penyebabnya kuota AI Gateway, bukan lambatnya
+        # query. Pesan generik "kendala teknis" menyesatkan user di kasus ini.
+        logger.warning(
+            "Rate limit persisted after retries for session=%s: %s",
+            session_id[:20], exc,
+        )
+        return MSG_RATE_LIMIT
 
     except Exception as exc:
         err_str = str(exc).lower()
@@ -381,15 +539,17 @@ async def run_crew_async(
                 "Crew execution time limit reached for session=%s: %s",
                 session_id[:20], exc,
             )
-            return (
-                "Sistem membutuhkan waktu lebih lama dari biasanya untuk memproses "
-                "permintaan ini. Silakan coba ulangi pertanyaan Anda."
+            return MSG_TIMEOUT
+        # 429 kadang datang sebagai APIError generik dari litellm, bukan
+        # RateLimitError — deteksi via string sebagai jaring terakhir.
+        if "rate limit" in err_str or "429" in err_str:
+            logger.warning(
+                "Rate limit (detected via message) for session=%s: %s",
+                session_id[:20], exc,
             )
+            return MSG_RATE_LIMIT
         logger.error("Crew async execution failed: %s", exc, exc_info=True)
-        return (
-            "Mohon maaf, sistem sedang mengalami kendala teknis. "
-            "Silakan coba beberapa saat lagi."
-        )
+        return MSG_GENERIC
 
     finally:
         # Selalu kirim sentinel None ke queue agar generator SSE tidak hang

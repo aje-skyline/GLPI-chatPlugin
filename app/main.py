@@ -26,7 +26,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.services.crew_orchestrator import run_crew, run_crew_async
+from openai import RateLimitError
+
+from app.services.crew_orchestrator import (
+    MSG_RATE_LIMIT,
+    AbortSignal,
+    RateLimitExhausted,
+    run_crew,
+    run_crew_async,
+)
 from app.agents.prompt_builder import _compress_for_history
 
 logger = logging.getLogger(__name__)
@@ -223,8 +231,17 @@ async def _stream_crew_response(
     # ── Jalankan crew sebagai coroutine (bukan thread pool manual) ────────────
     # run_crew_async() menggunakan kickoff_async() → asyncio.to_thread() secara
     # internal — event loop FastAPI TIDAK ter-block selama crew berjalan.
+    # AbortSignal: crew_task.cancel() TIDAK menghentikan worker thread di dalam
+    # kickoff_async() — thread akan terus memanggil LLM dan menghabiskan kuota
+    # rate-limit untuk request berikutnya. Signal ini diperiksa oleh
+    # step_callback di worker thread agar crew benar-benar berhenti.
+    abort_signal = AbortSignal()
+
     crew_task = asyncio.create_task(
-        run_crew_async(user_message, glpi_user_id, messages, step_queue, session_id)
+        run_crew_async(
+            user_message, glpi_user_id, messages, step_queue, session_id,
+            abort=abort_signal,
+        )
     )
 
     status_cycle = [
@@ -241,7 +258,10 @@ async def _stream_crew_response(
     # query supplier bahkan yang paling lambat seharusnya selesai < 40s.
     # 80s memberi headroom 2× sekaligus abort lebih awal daripada 110s,
     # mengurangi waktu tunggu user saat ada edge-case loop/hang.
-    _SERVER_TIMEOUT_S = 80  # Batalkan server-side sebelum client timeout 120s
+    #
+    # Nilai dibaca dari settings agar konsisten dengan budget retry 429 dan
+    # agent_max_execution_time_s (lihat invariant di app/config.py).
+    _SERVER_TIMEOUT_S = settings.server_timeout_s
 
     # ── Loop utama: konsumsi thought dari queue ───────────────────────────────
     while True:
@@ -249,9 +269,15 @@ async def _stream_crew_response(
 
         # Server-side timeout guard
         if elapsed >= _SERVER_TIMEOUT_S:
+            # Urutan penting: set abort DULU agar worker thread berhenti pada
+            # batas iterasi berikutnya, baru cancel() task yang menunggunya.
+            # Hanya cancel() akan meninggalkan thread yatim yang terus
+            # membakar kuota rate-limit dan memicu 429 pada request berikutnya.
+            abort_signal.abort()
             crew_task.cancel()
             logger.error(
-                "Crew async cancelled after %.0fs (server timeout) for session=%s",
+                "Crew aborted after %.0fs (server timeout) for session=%s — "
+                "abort signalled, worker thread akan berhenti di batas iterasi",
                 elapsed, session_id[:20],
             )
             yield _sse_event("error", {
@@ -462,7 +488,7 @@ async def chat_completions(request: Request, response: Response):
         # path juga terlindungi (sebelumnya tidak ada timeout eksplisit di sini).
         await asyncio.wait_for(
             flow.kickoff_async(),
-            timeout=80.0,
+            timeout=float(settings.server_timeout_s),
         )
         
         final_answer = flow.state.final_output
@@ -487,6 +513,15 @@ async def chat_completions(request: Request, response: Response):
             status_code=504,
             detail="Waktu pemrosesan habis. Silakan coba lagi dengan pertanyaan yang lebih spesifik."
         ) from te
+    except (RateLimitExhausted, RateLimitError) as exc:
+        # 429 dari AI Gateway diteruskan sebagai 429 (bukan 500) agar client
+        # dapat menerapkan backoff sendiri alih-alih menganggapnya bug server.
+        logger.warning("Rate limit for user_id=%s: %s", glpi_user_id, exc)
+        raise HTTPException(
+            status_code=429,
+            detail=MSG_RATE_LIMIT,
+            headers={"Retry-After": "10"},
+        ) from exc
     except Exception as exc:
         logger.exception("Crew error for user_id=%s", glpi_user_id)
         raise HTTPException(status_code=500, detail=f"Crew Error: {exc}") from exc

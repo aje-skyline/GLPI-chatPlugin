@@ -68,13 +68,23 @@ async def get_contracts(
             {
                 "id":         item.get("id", ""),
                 "name":       item.get("name", ""),
-                "num":        item.get("num", ""),
-                "type":       clean_value(item.get("contracttypes_id")),
+                # GLPI menamai field ini "num" (nomor kontrak). Skema REST
+                # yang lebih baru memakai "accounting_number" — coba keduanya.
+                "num":        clean_value(
+                    item.get("num") or item.get("accounting_number")
+                ),
+                # "type" bisa berupa contracttypes_id (expand_dropdowns) atau
+                # objek nested "type" pada skema REST baru.
+                "type":       clean_value(
+                    item.get("contracttypes_id") or item.get("type")
+                ),
                 "supplier":   clean_value(item.get("suppliers_id")),
                 "entity":     clean_value(item.get("entities_id")),
                 "cost":       item.get("cost", ""),
                 "begin_date": item.get("begin_date", ""),
                 "duration":   item.get("duration", ""),
+                # notice = periode pemberitahuan sebelum kontrak berakhir (bulan).
+                "notice":     item.get("notice", ""),
                 "end_date":   item.get("end_date", ""),
                 "comment":    strip_html(item.get("comment", "") or ""),
             }
@@ -108,13 +118,18 @@ async def get_contract_by_id(contract_id: int) -> dict[str, Any] | None:
         return {
             "id":         data.get("id", ""),
             "name":       data.get("name", ""),
-            "num":        data.get("num", ""),
-            "type":       clean_value(data.get("contracttypes_id")),
+            "num":        clean_value(
+                data.get("num") or data.get("accounting_number")
+            ),
+            "type":       clean_value(
+                data.get("contracttypes_id") or data.get("type")
+            ),
             "supplier":   clean_value(data.get("suppliers_id")),
             "entity":     clean_value(data.get("entities_id")),
             "cost":       data.get("cost", ""),
             "begin_date": data.get("begin_date", ""),
             "duration":   data.get("duration", ""),
+            "notice":     data.get("notice", ""),
             "end_date":   data.get("end_date", ""),
             "comment":    strip_html(data.get("comment", "") or ""),
         }

@@ -117,12 +117,12 @@ PEMETAAN INTENT → TOOL:
 "Daftarkan / tampilkan X?"             → Panggil tool get_X()
 """
 
-_CONTRACT_TOOL_GUIDANCE: str = """
-   2 [PANDUAN KONTRAK]
-   3 - User tanya JUMLAH -> count_contracts()
-   4 - User tanya DAFTAR -> list_all_contracts()
-   5 - JANGAN panggil keduanya sekaligus. list_all_contracts sudah memberikan total count.
-   6 - Jika data > 5, cukup sebutkan totalnya dan berikan 5 sampel saja.
+_CONTRACT_TOOL_GUIDANCE: str = """\
+[PANDUAN KONTRAK]
+- User tanya JUMLAH -> count_contracts()
+- User tanya DAFTAR -> list_all_contracts()
+- JANGAN panggil keduanya sekaligus. list_all_contracts sudah memberikan total count.
+- Jika data > 5, cukup sebutkan totalnya dan berikan 5 sampel saja.
 
 ATURAN WAJIB UNTUK "DAFTAR SEMUA" / "TAMPILKAN SEMUA KONTRAK":
 1. PANGGIL list_all_contracts() — SEKALI SAJA.
@@ -149,6 +149,80 @@ PEMETAAN INTENT → TOOL:
 "Berapa total / jumlah X?"                → WAJIB panggil tool count_X()
 "Daftarkan / tampilkan X?"                → Panggil tool get_X()
 """
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Relevance-Based Guidance Selection
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# MENGAPA INI ADA (analisis log produksi 2026-08-31):
+#   Sebelumnya KETIGA blok panduan (_LARGE_DATA_GUIDANCE, _SUPPLIER_*,
+#   _CONTRACT_*) selalu disuntikkan ke task description. Totalnya ~3.500 token.
+#
+#   Task description dikirim ULANG pada SETIAP LLM call dalam satu ReAct loop.
+#   Untuk 4 call, ~14.000 token terbuang hanya untuk panduan — termasuk panduan
+#   komputer/aset saat user hanya bertanya soal kontrak & supplier.
+#
+#   Dampak terukur di log: LLM call terakhir memakan 51 detik (13:52:16 →
+#   13:53:07) sehingga total 84s > server timeout 80s. Memangkas panduan yang
+#   tidak relevan adalah cara paling efektif menurunkan latensi, karena waktu
+#   inferensi tumbuh seiring panjang prompt.
+#
+# STRATEGI:
+#   Cocokkan keyword pada pertanyaan user. Jika tidak ada yang cocok (pertanyaan
+#   ambigu), sertakan SEMUA panduan agar perilaku tidak menjadi lebih buruk
+#   daripada sebelumnya — fail-safe, bukan fail-fast.
+
+_COMPUTER_KEYWORDS: tuple[str, ...] = (
+    "komputer", "computer", "pc", "laptop", "aset", "asset", "inventaris",
+    "inventory", "os", "operating system", "windows", "linux", "lokasi",
+    "location", "status", "serial", "hostname",
+)
+
+_SUPPLIER_KEYWORDS: tuple[str, ...] = (
+    "supplier", "vendor", "pemasok", "penyedia", "distributor",
+)
+
+_CONTRACT_KEYWORDS: tuple[str, ...] = (
+    "kontrak", "contract", "perjanjian", "sla", "maintenance", "lisensi",
+    "license", "berlangganan", "subscription",
+)
+
+
+def _select_guidance(user_message: str) -> str:
+    """Pilih blok panduan yang relevan dengan pertanyaan user.
+
+    Memangkas task description secara signifikan (~3.500 → ~1.200 token untuk
+    pertanyaan spesifik domain), yang langsung menurunkan latensi setiap LLM
+    call dalam ReAct loop.
+
+    Args:
+        user_message: Pertanyaan terbaru dari user.
+
+    Returns:
+        Gabungan blok panduan yang relevan, dipisah newline. Jika tidak ada
+        keyword yang cocok, kembalikan SEMUA panduan (fail-safe untuk
+        pertanyaan ambigu seperti "tampilkan semua data").
+    """
+    msg = user_message.lower()
+
+    blocks: list[str] = []
+    if any(k in msg for k in _COMPUTER_KEYWORDS):
+        blocks.append(_LARGE_DATA_GUIDANCE)
+    if any(k in msg for k in _SUPPLIER_KEYWORDS):
+        blocks.append(_SUPPLIER_TOOL_GUIDANCE)
+    if any(k in msg for k in _CONTRACT_KEYWORDS):
+        blocks.append(_CONTRACT_TOOL_GUIDANCE)
+
+    # Fail-safe: pertanyaan ambigu tetap mendapat konteks penuh.
+    if not blocks:
+        return "\n".join((
+            _LARGE_DATA_GUIDANCE,
+            _SUPPLIER_TOOL_GUIDANCE,
+            _CONTRACT_TOOL_GUIDANCE,
+        ))
+
+    return "\n".join(blocks)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -270,9 +344,26 @@ def _build_task_description(
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ATURAN DATA BESAR:
 Jika hasil tool berisi "[INSTRUKSI SISTEM]" → TULIS Final Answer LANGSUNG.
-DILARANG panggil tool lagi. Sebut totalcount exact + 5 sampel saja.
+DILARANG panggil tool lagi UNTUK DOMAIN YANG SAMA. Sebut totalcount exact + 5 sampel saja.
 PENTING: JANGAN tampilkan/copy teks "[INSTRUKSI SISTEM]" ke user.
-Looping tool = TIMEOUT = Error.
+Looping tool untuk domain yang sama = TIMEOUT = Error.
+
+ATURAN PERTANYAAN MULTI-DOMAIN:
+Jika user menanyakan BEBERAPA domain sekaligus (mis. "kontrak DAN supplier"),
+panggil SATU tool untuk SETIAP domain — ini BUKAN looping dan DIPERBOLEHKAN.
+Setelah semua domain terpenuhi, langsung tulis Final Answer.
+
+ATURAN FORMAT PEMANGGILAN TOOL (WAJIB):
+Action Input HARUS berupa SATU objek JSON tunggal, BUKAN array/list.
+✅ BENAR : {{"limit": 5}}
+❌ SALAH : [{{"limit": 5}}, {{"name": null}}]
+Satu Action = satu tool = satu objek JSON. Jangan gabungkan argumen
+beberapa tool dalam satu Action Input.
+
+ATURAN KEJUJURAN DATA (WAJIB):
+Jika tool mengembalikan "Error" atau gagal, Anda DILARANG mengarang data.
+Katakan terus terang bahwa pengambilan data gagal. JANGAN PERNAH menyebut
+nama, angka, alamat, atau ID yang tidak ada di output tool.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PANDUAN PENGERJAAN:
@@ -291,9 +382,7 @@ PANDUAN PENGERJAAN:
 
 3. Gunakan {uid_label} jika tool membutuhkan user_id.
 
-{_LARGE_DATA_GUIDANCE}
-{_SUPPLIER_TOOL_GUIDANCE}
-{_CONTRACT_TOOL_GUIDANCE}
+{_select_guidance(user_message)}
 
 4. Final Answer: Bahasa Indonesia, sopan, NO JSON/Thought/Action tags.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""

@@ -45,18 +45,26 @@ logger = logging.getLogger(__name__)
 # Field ID untuk /search/Supplier yang digunakan pada forcedisplay[] DAN
 # criteria[]. Sumber: GLPI 10.x standard field mapping (verified).
 # Verifikasi via: GET /listSearchOptions/Supplier
+#
+# ⚠️ BELUM TERVERIFIKASI terhadap instance GLPI ini.
+# Log produksi 2026-08-31 membuktikan sebagian mapping ini SALAH:
+#   "Alamat  : 2018-02-19 18:05:51"          → field 19 mengembalikan date_mod
+#   "Telepon : www.synnexmetrodata.com"      → field 4  mengembalikan website
+# Artinya field 19 dan 4 (dan kemungkinan 5/6/20-23) tidak sesuai skema
+# instance ini. WAJIB verifikasi via GET /listSearchOptions/Supplier lalu
+# perbaiki angka di bawah — jangan menebak.
 _SUPPLIER_FIELD_IDS: dict[str, int] = {
-    "id":       2,    # ID
-    "name":     1,    # Name
-    "entity":   80,   # Entity (entities_id)
-    "phone":    4,    # Phonenumber (Sebelumnya 5)
-    "fax":      5,    # Fax (Sebelumnya 10)
-    "email":    6,    # Email
-    "address":  19,   # Address (Sebelumnya 3)
-    "postcode": 20,   # Postal code (Sebelumnya 14)
-    "town":     21,   # Town / City (Sebelumnya 11)
-    "state":    22,   # State (Sebelumnya 12)
-    "country":  23,   # Country (Sebelumnya 13)
+    "id":       2,    # ID       — terbukti benar di log
+    "name":     1,    # Name     — terbukti benar di log
+    "entity":   80,   # Entity   — terbukti benar di log
+    "phone":    4,    # ❌ SALAH: mengembalikan website
+    "fax":      5,    # ⚠️ perlu verifikasi
+    "email":    6,    # ⚠️ perlu verifikasi
+    "address":  19,   # ❌ SALAH: mengembalikan date_mod
+    "postcode": 20,   # ⚠️ perlu verifikasi
+    "town":     21,   # ⚠️ perlu verifikasi
+    "state":    22,   # ⚠️ perlu verifikasi
+    "country":  23,   # ⚠️ perlu verifikasi
 }
 
 # Field yang digunakan sebagai criteria filter (subset dari _SUPPLIER_FIELD_IDS)

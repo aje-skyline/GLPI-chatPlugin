@@ -49,6 +49,12 @@ def clean_value(value: Any) -> str:
     """
     if value is None:
         return ""
+    # GLPI versi baru (high-level REST) mengembalikan dropdown sebagai objek
+    # nested {"id": 3, "name": "Maintenance"} alih-alih string hasil
+    # expand_dropdowns. Tanpa penanganan ini, str(dict) menghasilkan
+    # "{'id': 3, 'name': 'Maintenance'}" yang bocor ke jawaban LLM.
+    if isinstance(value, dict):
+        value = value.get("name") or value.get("completename") or ""
     s = str(value).strip()
     if s in ("", "0", "None"):
         return ""

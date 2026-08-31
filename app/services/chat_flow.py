@@ -56,7 +56,7 @@ class GLPIChatFlow(Flow[GLPIChatState]):
         
         try:
             response = completion(
-                model=f"openai/{settings.ai_model}",
+                model=settings.ai_model,
                 api_key=settings.ai_gateway_api_key,
                 api_base=settings.resolved_ai_gateway_base_url,
                 messages=messages,
@@ -87,7 +87,7 @@ class GLPIChatFlow(Flow[GLPIChatState]):
         
         try:
             response = completion(
-                model=f"openai/{settings.ai_model}",
+                model=settings.ai_model,
                 api_key=settings.ai_gateway_api_key,
                 api_base=settings.resolved_ai_gateway_base_url,
                 messages=messages,

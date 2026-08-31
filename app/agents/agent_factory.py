@@ -164,7 +164,7 @@ def _get_llm() -> LLM:
     with _llm_lock:
         if _llm_instance is None:
             _llm_instance = LLM(
-                model=f"openai/{settings.ai_model}",
+                model=settings.ai_model,
                 api_key=settings.ai_gateway_api_key,
                 api_base=settings.resolved_ai_gateway_base_url,
                 temperature=0.0,
@@ -242,10 +242,22 @@ def build_it_support(llm: LLM, glpi_user_id: int = 0) -> Agent:  # noqa: ARG001
         # Query sederhana (count/search) selesai 2 iter: tool call + Final Answer.
         # Query kompleks (search → detail → compare) butuh maks 3-4 iter.
         # 5 = safety net cukup tanpa risiko loop panjang.
-        max_iter=5,
+        # max_iter=7: Naik dari 5.
+        # Log 2026-08-31 menunjukkan pertanyaan multi-domain ("kontrak DAN
+        # supplier") memakai 4 iterasi hanya untuk tool call — 1 di antaranya
+        # terbuang karena LLM mengirim Action Input berbentuk array. Dengan
+        # max_iter=5, tidak ada ruang tersisa untuk menulis Final Answer.
+        max_iter=7,
         max_retry_limit=2,
-        # max_execution_time=55: Hard-stop 55s < server timeout 80s (main.py).
-        # Memberi buffer 25s untuk cleanup SSE + sentinel queue.
-        # CrewAI raise exception saat limit tercapai → ditangkap di crew_orchestrator.py.
-        max_execution_time=55,
+        # Hard-stop CrewAI < server timeout (invariant didokumentasikan di
+        # app/config.py). Memberi buffer untuk cleanup SSE + sentinel queue.
+        # CrewAI raise exception saat limit tercapai → ditangkap di
+        # crew_orchestrator.py dan dipetakan ke MSG_TIMEOUT.
+        #
+        # Ini adalah lapis pertahanan KEDUA. Lapis pertama adalah cooperative
+        # abort via step_callback (AbortSignal di crew_orchestrator.py), yang
+        # diperlukan karena max_execution_time hanya dievaluasi CrewAI pada
+        # batas iterasi — sama seperti abort — sehingga keduanya tidak dapat
+        # menghentikan satu panggilan LLM/tool yang sedang berjalan.
+        max_execution_time=settings.agent_max_execution_time_s,
     )
